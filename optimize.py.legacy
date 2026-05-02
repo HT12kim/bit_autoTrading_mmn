@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""
+optimize.py — Parameter grid search for the integrated strategy (5-min BTC/KRW).
+
+Fetches / caches 1-year data once, then sweeps key parameters to find
+configurations with the best Sharpe ratio.
+"""
+from __future__ import annotations
+
+import itertools
+import math
+import pickle
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyupbit
+from datetime import datetime, timedelta
+
+from strategy import add_indicators
+
+TICKER   = "KRW-BTC"
+INTERVAL = "minute5"
+FEE      = 0.0005
+CACHE    = Path("data_cache.pkl")
+
+# ── Parameters to sweep ────────────────────────────────────────────────────────
+PARAM_GRID = {
+    "ADX_TREND_THRESHOLD": [25, 28, 30],
+    "ADX_ENTRY_MIN":       [28, 30, 33, 35],
+    "BREAKOUT_K":          [0.2, 0.3, 0.5],
+    "MAX_HOLD_CANDLES":    [24, 36, 48],
+    "TRAIL_ACTIVATE_PCT":  [0.010, 0.015, 0.020],
+    "ATR_STOP_MULT":       [2.0, 2.5, 3.0],
+}
+
+# ── Fixed parameters ───────────────────────────────────────────────────────────
+FIXED = {
+    "RSI_OVERSOLD":        35,
+    "VOLATILITY_FILTER":   0.015,
+    "VOL_MULTIPLIER":      1.5,
+    "BREAKOUT_PERIOD":     288,
+    "TREND_RSI_MIN":       45,
+    "TREND_RSI_MAX":       65,
+    "GRID_ATR_MULT":       1.5,
+    "GRID_MAX_ATR_RATIO":  0.004,
+    "GRID_RSI_MAX":        35,
+    "TRAIL_STOP_PCT":      0.015,
+    "TAKE_PROFIT":         0.030,
+    "HARD_STOP_PCT":       0.025,
+    # warmup helpers
+    "BB_PERIOD":           20,
+    "OBV_MA_PERIOD":       10,
+    "EMA_MED":             60,
+    "ADX_PERIOD":          14,
+}
+
+
+# ── Data fetch / cache ─────────────────────────────────────────────────────────
+
+def fetch_year_of_data() -> pd.DataFrame:
+    cutoff = pd.Timestamp(datetime.now() - timedelta(days=365))
+    all_frames: list[pd.DataFrame] = []
+    to: str | None = None
+
+    print("1년치 5분봉 KRW-BTC 데이터 로딩 중...")
+
+    while True:
+        kwargs: dict = {"count": 200}
+        if to:
+            kwargs["to"] = to
+
+        df = None
+        for attempt in range(4):
+            try:
+                df = pyupbit.get_ohlcv(TICKER, interval=INTERVAL, **kwargs)
+                break
+            except Exception as exc:
+                wait = 2 ** attempt
+                print(f"\n  fetch error (attempt {attempt+1}): {exc}; {wait}s 재시도...")
+                time.sleep(wait)
+
+        if df is None or df.empty:
+            break
+
+        all_frames.append(df)
+        if len(all_frames) % 50 == 0:
+            print(f"\n  {len(all_frames)*200:,} 캔들 수집 중...", end="", flush=True)
+        else:
+            print(".", end="", flush=True)
+
+        if df.index[0] <= cutoff:
+            break
+
+        to = df.index[0].strftime("%Y-%m-%d %H:%M:%S")
+        time.sleep(0.13)
+
+    print("\n  수집 완료")
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_frames).sort_index()
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined[combined.index >= cutoff].copy()
+
+
+def load_data() -> pd.DataFrame:
+    if CACHE.exists():
+        age_h = (time.time() - CACHE.stat().st_mtime) / 3600
+        if age_h < 6:
+            print(f"캐시 데이터 사용 (최신화: {age_h:.1f}시간 전)")
+            with open(CACHE, "rb") as f:
+                return pickle.load(f)
+        print("캐시 만료 — 새로 다운로드합니다.")
+
+    raw = fetch_year_of_data()
+    if raw.empty or len(raw) < 1_000:
+        print("데이터 부족.")
+        sys.exit(1)
+
+    with open(CACHE, "wb") as f:
+        pickle.dump(raw, f)
+    return raw
+
+
+# ── Parameterized simulation ───────────────────────────────────────────────────
+
+def _entry_signal(c, p, P: dict) -> str | None:
+    trending = c["adx"] > P["ADX_TREND_THRESHOLD"]
+
+    # 1. Volatility Breakout
+    if trending and c["adx"] >= P["ADX_ENTRY_MIN"] and c["plus_di"] > c["minus_di"]:
+        bt = c["breakout_target"]
+        pt = p["breakout_target"]
+        if not (math.isnan(bt) or math.isnan(pt)):
+            if c["close"] > bt and p["close"] <= bt and c["volume"] >= 1.5 * c["volume_ma"]:
+                return "BREAKOUT"
+
+    # 2. Trend Following
+    if trending and c["adx"] >= P["ADX_ENTRY_MIN"]:
+        ema_cross = c["ema_fast"] > c["ema_slow"] and p["ema_fast"] <= p["ema_slow"]
+        if (ema_cross
+                and c["ema_slow"] > c["ema_med"]
+                and c["plus_di"] > c["minus_di"]
+                and P["TREND_RSI_MIN"] <= c["rsi"] <= P["TREND_RSI_MAX"]
+                and c["volume"] >= 1.5 * c["volume_ma"]):
+            return "TREND"
+
+    # 3. Mean Reversion
+    atr_r = c["atr"] / c["close"] if c["close"] > 0 else 1.0
+    if (c["rsi"] < P["RSI_OVERSOLD"]
+            and c["close"] <= c["bb_lower"]
+            and c["volume"] >= P["VOL_MULTIPLIER"] * c["volume_ma"]
+            and c["ema_fast"] >= p["ema_fast"]
+            and c["obv"] >= p["obv"]
+            and atr_r < P["VOLATILITY_FILTER"]):
+        return "MEAN_REV"
+
+    # 4. Grid
+    if not trending:
+        grid_r = c["atr"] / c["close"] if c["close"] > 0 else 1.0
+        grid_l = c["ema_slow"] - P["GRID_ATR_MULT"] * c["atr"]
+        if (grid_r < P["GRID_MAX_ATR_RATIO"]
+                and c["close"] <= grid_l
+                and c["rsi"] < P["GRID_RSI_MAX"]
+                and c["ema_fast"] >= p["ema_fast"]):
+            return "GRID"
+
+    return None
+
+
+def simulate(df: pd.DataFrame, P: dict) -> tuple[list[dict], pd.Series]:
+    warmup = max(P["BB_PERIOD"], P["OBV_MA_PERIOD"], P["EMA_MED"],
+                 P["BREAKOUT_PERIOD"] * 2, P["ADX_PERIOD"]) + 10
+
+    in_position  = False
+    entry_price  = peak_price = 0.0
+    candles_held = 0
+    strategy_type: str = ""
+
+    trades: list[dict] = []
+    equity = 1.0
+    eq_ts: dict = {}
+
+    for i in range(warmup, len(df) - 1):
+        c = df.iloc[i]
+        p = df.iloc[i - 1]
+        eq_ts[c.name] = equity
+
+        if in_position:
+            peak_price    = max(peak_price, c["high"])
+            candles_held += 1
+
+            exit_price = reason = None
+
+            tp = entry_price * (1 + P["TAKE_PROFIT"])
+            if c["high"] >= tp:
+                exit_price, reason = tp, "TAKE_PROFIT"
+
+            if exit_price is None:
+                pk_pnl = (peak_price - entry_price) / entry_price
+                if pk_pnl >= P["TRAIL_ACTIVATE_PCT"]:
+                    floor = peak_price * (1 - P["TRAIL_STOP_PCT"])
+                    if c["low"] <= floor:
+                        exit_price, reason = floor, "TRAIL_STOP"
+
+            if exit_price is None:
+                atr_stop = entry_price - c["atr"] * P["ATR_STOP_MULT"]
+                if c["low"] <= atr_stop:
+                    exit_price, reason = max(atr_stop, c["low"]), "ATR_STOP"
+
+            if exit_price is None:
+                hard = entry_price * (1 - P["HARD_STOP_PCT"])
+                if c["low"] <= hard:
+                    exit_price, reason = hard, "HARD_STOP"
+
+            if exit_price is None and candles_held >= P["MAX_HOLD_CANDLES"]:
+                exit_price, reason = c["close"], "TIME_STOP"
+
+            if exit_price is not None:
+                pnl = (exit_price / entry_price - 1) - 2 * FEE
+                equity *= (1 + pnl)
+                trades.append({
+                    "pnl":      pnl,
+                    "reason":   reason,
+                    "strategy": strategy_type,
+                })
+                in_position   = False
+                peak_price    = 0.0
+                candles_held  = 0
+
+        else:
+            sig = _entry_signal(c, p, P)
+            if sig is not None:
+                nc            = df.iloc[i + 1]
+                entry_price   = nc["open"]
+                strategy_type = sig
+                in_position   = True
+                peak_price    = entry_price
+                candles_held  = 0
+
+    return trades, pd.Series(eq_ts, name="equity")
+
+
+def score_result(trades: list[dict], equity: pd.Series) -> dict:
+    if len(trades) < 5:
+        return {"sharpe": -999.0, "ret": -999.0, "mdd": -1.0,
+                "trades": len(trades), "win_rate": 0.0}
+
+    pnls = pd.Series([t["pnl"] for t in trades])
+    year_span = max((equity.index[-1] - equity.index[0]).days / 365, 1e-9)
+    tpy       = len(pnls) / year_span
+    sharpe    = pnls.mean() / pnls.std() * np.sqrt(tpy) if pnls.std() > 0 else 0.0
+
+    peak = equity.cummax()
+    mdd  = ((equity - peak) / peak).min()
+
+    return {
+        "sharpe":   sharpe,
+        "ret":      equity.iloc[-1] - 1,
+        "mdd":      mdd,
+        "trades":   len(trades),
+        "win_rate": (pnls > 0).mean(),
+    }
+
+
+# ── Grid search ────────────────────────────────────────────────────────────────
+
+def run_grid_search(df_base: pd.DataFrame) -> list[dict]:
+    keys   = list(PARAM_GRID.keys())
+    values = list(PARAM_GRID.values())
+    combos = list(itertools.product(*values))
+    total  = len(combos)
+    print(f"\n총 {total}개 조합 탐색 시작...\n")
+
+    results = []
+    last_K  = None  # track breakout_K to avoid redundant recomputation
+
+    for idx, combo in enumerate(combos, 1):
+        P = {**FIXED, **dict(zip(keys, combo))}
+
+        # Update breakout_target only when BREAKOUT_K changes
+        K = P["BREAKOUT_K"]
+        if K != last_K:
+            df_base = df_base.copy()
+            df_base["breakout_target"] = (
+                df_base["breakout_high"] + K * df_base["breakout_range"]
+            )
+            last_K = K
+
+        trades, equity = simulate(df_base, P)
+        s = score_result(trades, equity)
+
+        results.append({**dict(zip(keys, combo)), **s})
+
+        if idx % 50 == 0 or idx == total:
+            best_sharpe = max(r["sharpe"] for r in results)
+            print(
+                f"  [{idx:4d}/{total}]  "
+                f"현재: sharpe={s['sharpe']:+.2f} ret={s['ret']*100:+.1f}%  "
+                f"(최고 sharpe={best_sharpe:+.2f})"
+            )
+
+    return results
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    raw = load_data()
+    print(f"데이터: {len(raw):,} 캔들  ({raw.index[0].date()} → {raw.index[-1].date()})")
+
+    print("기본 인디케이터 계산 중...")
+    df_base = add_indicators(raw.copy())
+
+    results = run_grid_search(df_base)
+
+    # Sort by Sharpe, then by return
+    results.sort(key=lambda r: (r["sharpe"], r["ret"]), reverse=True)
+
+    sep = "=" * 90
+    print(f"\n{sep}")
+    print("  상위 20개 파라미터 조합  (샤프 순)")
+    print(sep)
+    header = (
+        f"{'#':>3}  {'RSI':>4}  {'VF%':>5}  {'K':>5}  {'TP%':>5}  {'HS%':>5}"
+        f"  {'Sharpe':>7}  {'Ret%':>7}  {'MDD%':>7}  {'Trades':>6}  {'WR%':>5}"
+        f"  전략분포"
+    )
+    print(header)
+    print("─" * 90)
+
+    # Re-run top 20 to get per-strategy breakdown
+    keys = list(PARAM_GRID.keys())
+    last_K = None
+
+    for rank, r in enumerate(results[:20], 1):
+        P = {**FIXED, **{k: r[k] for k in keys}}
+        K = P["BREAKOUT_K"]
+        if K != last_K:
+            df_top = df_base.copy()
+            df_top["breakout_target"] = (
+                df_top["breakout_high"] + K * df_top["breakout_range"]
+            )
+            last_K = K
+
+        trades, _ = simulate(df_top, P)
+        if trades:
+            strat_cnt = pd.Series([t["strategy"] for t in trades]).value_counts()
+            strat_str = "  ".join(
+                f"{s}:{strat_cnt[s]}" for s in ["BREAKOUT", "TREND", "MEAN_REV", "GRID"]
+                if s in strat_cnt
+            )
+        else:
+            strat_str = "—"
+
+        print(
+            f"{rank:3d}  "
+            f"{r['RSI_OVERSOLD']:4.0f}  "
+            f"{r['VOLATILITY_FILTER']*100:5.2f}  "
+            f"{r['BREAKOUT_K']:5.2f}  "
+            f"{r['TAKE_PROFIT']*100:5.1f}  "
+            f"{r['HARD_STOP_PCT']*100:5.1f}  "
+            f"{r['sharpe']:+7.2f}  "
+            f"{r['ret']*100:+7.2f}  "
+            f"{r['mdd']*100:7.2f}  "
+            f"{r['trades']:6d}  "
+            f"{r['win_rate']*100:5.1f}  "
+            f"{strat_str}"
+        )
+
+    print(sep)
+
+    # Print recommended params (top 1)
+    best = {**FIXED, **{k: results[0][k] for k in keys}}
+    print("\n  ✦ 추천 파라미터 (strategy.py 적용 기준):")
+    for k in keys:
+        print(f"    {k:<22} = {results[0][k]}")
+    print()
+
+
+if __name__ == "__main__":
+    main()

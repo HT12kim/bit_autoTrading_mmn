@@ -1,0 +1,12 @@
+.env
+.venv/
+.pytest_cache/
+.pycache/
+.claude/
+__pycache__/
+*.py[cod]
+.DS_Store
+state.json
+backtest_result.log
+data_cache_*.pkl
+daily_cache_*.pkl
