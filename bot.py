@@ -91,7 +91,10 @@ def save_state(state: dict) -> None:
 def reset_if_new_day(state: dict, current_equity: float) -> None:
     today = datetime.now().strftime("%Y-%m-%d")
     if state.get("date") != today:
-        log.info("새 거래일 — 리스크 카운터 초기화 (시작 자산: %,.0f KRW)", current_equity)
+        log.info(
+            "새 거래일 — 리스크 카운터 초기화 (시작 자산: %s KRW)",
+            f"{current_equity:,.0f}",
+        )
         state.update({
             "date":               today,
             "daily_pnl_krw":      0.0,
@@ -365,8 +368,8 @@ def main() -> None:
                 config=cfg,
             )
             log.info(
-                "[%s] 보유 | 진입=%,.0f 현재=%,.0f | %s",
-                ticker, entry_price, current_price, sell_reason,
+                "[%s] 보유 | 진입=%s 현재=%s | %s",
+                ticker, f"{entry_price:,.0f}", f"{current_price:,.0f}", sell_reason,
             )
 
             if sell_ok:
@@ -385,8 +388,8 @@ def main() -> None:
                     pnl_krw = invest_krw * pnl_rate
 
                     log.info(
-                        "[%s] 매도 완료 — %s | PnL=%+.2f%% (%+,.0f KRW)",
-                        ticker, sell_reason, pnl_rate * 100, pnl_krw,
+                        "[%s] 매도 완료 — %s | PnL=%+.2f%% (%s KRW)",
+                        ticker, sell_reason, pnl_rate * 100, f"{pnl_krw:+,.0f}",
                     )
                     notify_trade_execution(
                         side="매도",
@@ -443,6 +446,18 @@ def main() -> None:
                 invest_krw = min(equity * PER_TRADE_RATIO, krw_balance)
                 if invest_krw < MIN_ORDER_KRW:
                     log.warning("[%s] KRW 잔고 부족 (%.0f < %d)", ticker, invest_krw, MIN_ORDER_KRW)
+                    send_telegram_message(
+                        "\n".join(
+                            [
+                                "<b>매수 실패</b>",
+                                f"시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                f"종목: {ticker}",
+                                f"사유: KRW 잔고 부족",
+                                f"가용 금액: {invest_krw:,.0f} KRW",
+                                f"최소 주문 금액: {MIN_ORDER_KRW:,.0f} KRW",
+                            ]
+                        )
+                    )
                     continue
 
                 try:
@@ -457,8 +472,8 @@ def main() -> None:
                     }
                     krw_balance -= invest_krw
                     log.info(
-                        "[%s] 매수 완료 | 투자=%,.0f KRW | %s",
-                        ticker, invest_krw, buy_reason,
+                        "[%s] 매수 완료 | 투자=%s KRW | %s",
+                        ticker, f"{invest_krw:,.0f}", buy_reason,
                     )
                     notify_trade_execution(
                         side="매수",
@@ -469,13 +484,25 @@ def main() -> None:
                     )
                 except Exception as exc:
                     log.error("[%s] 매수 주문 실패: %s", ticker, exc)
+                    send_telegram_message(
+                        "\n".join(
+                            [
+                                "<b>매수 실패</b>",
+                                f"시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                f"종목: {ticker}",
+                                f"사유: 매수 주문 실패",
+                                f"주문 금액: {invest_krw:,.0f} KRW",
+                                f"오류: {exc}",
+                            ]
+                        )
+                    )
 
         # ── 상태 저장 ──────────────────────────────────────────────────────────
         save_state(state)
         log.info(
-            "사이클 완료 | 자산=%,.0f KRW | 일일PnL=%+,.0f KRW | 보유=%d종목 | 연속손실=%d",
-            equity,
-            state["daily_pnl_krw"],
+            "사이클 완료 | 자산=%s KRW | 일일PnL=%s KRW | 보유=%d종목 | 연속손실=%d",
+            f"{equity:,.0f}",
+            f"{state['daily_pnl_krw']:+,.0f}",
             len(state["positions"]),
             state["consecutive_losses"],
         )
