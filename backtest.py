@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-backtest.py - 1-minute 1-year multi-coin walk-forward backtest.
+backtest.py - 1-hour multi-coin walk-forward backtest.
 
 The backtest deliberately calls strategy.py for all entry/exit decisions so
 live trading and research cannot drift apart.
@@ -8,39 +8,54 @@ live trading and research cannot drift apart.
 
 from __future__ import annotations
 
-import pickle
 import argparse
+import pickle
 import time
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pyupbit
 
-from bot import MAX_CONCURRENT, PER_TRADE_RATIO
+from bot import (
+    EXCLUDED_TICKERS,
+    MAX_CONCURRENT,
+    PER_TRADE_RATIO,
+    PER_TRADE_RATIO_SPIKE,
+    UNIVERSE_TOP_N,
+)
 from strategy import (
     DEFAULT_SLIPPAGE,
-    ROUND_TRIP_FEE,
     StrategyConfig,
     add_indicators,
+    adaptive_stop_price,
     cooldown_until_after_loss,
     entry_signal,
     exit_signal,
     get_strategy_config,
 )
+from universe import (
+    UNIVERSE_ATR_EXCLUDE_RATIO,
+    UNIVERSE_BETA_MIN,
+    UNIVERSE_BETA_TOP_N,
+    UNIVERSE_DAILY_LOOKBACK_MINUTES,
+    UNIVERSE_MIN_DAILY_QUOTE_KRW,
+    UNIVERSE_NOISE_THRESHOLD,
+    UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    get_krw_tickers,
+    price_noise_pct,
+    quote_volume_krw,
+)
 
-TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-ADA"]
-INTERVAL = "minute1"
+DEFAULT_TICKERS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-ADA"]
+INTERVAL = "minute60"
 INITIAL_KRW = 1_000_000
-FEE = ROUND_TRIP_FEE
+FEE = 0.001  # Upbit 0.05% buy + 0.05% sell
 SLIPPAGE = DEFAULT_SLIPPAGE
-TRAIN_RATIO = 0.70
 
 
 def _cache_path(ticker: str) -> Path:
-    return Path(f"data_cache_{ticker.replace('-', '_')}.pkl")
+    return Path(f"data_cache_{ticker.replace('-', '_')}_{INTERVAL}.pkl")
 
 
 def fetch_year_of_data(ticker: str, *, refresh_cache: bool = False) -> pd.DataFrame:
@@ -60,7 +75,7 @@ def fetch_year_of_data(ticker: str, *, refresh_cache: bool = False) -> pd.DataFr
     all_frames: list[pd.DataFrame] = []
     to: str | None = None
 
-    print(f"[{ticker}] downloading 1y of 1m candles...")
+    print(f"[{ticker}] downloading 1y of 1h candles...")
     while True:
         kwargs: dict = {"count": 200}
         if to:
@@ -109,10 +124,17 @@ def simulate_ticker(
     config: StrategyConfig,
     fee: float = FEE,
     slippage: float = SLIPPAGE,
+    start_at: pd.Timestamp | None = None,
 ) -> tuple[list[dict], pd.Series]:
     in_position = False
     entry_price = 0.0
     entry_time: pd.Timestamp | None = None
+    highest_price = 0.0
+    trailing_active = False
+    partial_taken = False
+    bb_break_seen = False
+    overbought_seen = False
+    position_fraction = 1.0
     signal_type = ""
     cooldown_until: pd.Timestamp | None = None
 
@@ -123,20 +145,41 @@ def simulate_ticker(
     for i in range(1, len(df) - 1):
         c = df.iloc[i]
         p = df.iloc[i - 1]
+        if start_at is not None and c.name < start_at:
+            continue
         eq_ts[c.name] = equity
 
         if in_position:
-            exit_price, reason = exit_signal(
+            exit_price, reason, trailing_active, highest_price, overbought_seen, bb_break_seen = exit_signal(
                 c,
                 entry_price=entry_price,
+                previous=p,
                 entry_time=entry_time,
                 current_time=c.name,
+                partial_taken=partial_taken,
+                bb_break_seen=bb_break_seen,
+                overbought_seen=overbought_seen,
                 config=config,
                 use_ohlc=True,
+                take_profit_armed=trailing_active,
+                highest_price=highest_price,
             )
             if exit_price is not None:
+                if reason.startswith("PARTIAL_TAKE_PROFIT_50"):
+                    net_pnl = (exit_price / entry_price - 1) - fee - (2 * slippage)
+                    equity *= 1 + (net_pnl * 0.5)
+                    partial_taken = True
+                    position_fraction = 0.5
+                    trailing_active = True
+                    continue
+                if reason.startswith("PARTIAL_TAKE_PROFIT_25_BB_REV"):
+                    net_pnl = (exit_price / entry_price - 1) - fee - (2 * slippage)
+                    equity *= 1 + (net_pnl * 0.25)
+                    position_fraction = 0.25
+                    partial_taken = True
+                    continue
                 net_pnl = (exit_price / entry_price - 1) - fee - (2 * slippage)
-                equity *= 1 + net_pnl
+                equity *= 1 + (net_pnl * position_fraction)
                 reason_code = reason.split()[0]
                 trades.append(
                     {
@@ -162,11 +205,18 @@ def simulate_ticker(
             config=config,
             cooldown_until=cooldown_until,
             now=c.name,
+            market_current=c if ticker == "KRW-BTC" else None,
         )
         if ok:
             nc = df.iloc[i + 1]
             entry_price = float(nc["open"]) * (1 + slippage)
             entry_time = nc.name
+            highest_price = entry_price
+            trailing_active = False
+            partial_taken = False
+            bb_break_seen = False
+            position_fraction = 1.0
+            overbought_seen = False
             signal_type = reason.split("]", 1)[0].replace("[", "")
             in_position = True
 
@@ -199,6 +249,11 @@ def simulate_portfolio(
     initial_krw: float = INITIAL_KRW,
     fee: float = FEE,
     slippage: float = SLIPPAGE,
+    dynamic_universe: bool = False,
+    universe_mode: str = "hourly",
+    universe_limit: int = UNIVERSE_TOP_N,
+    universe_lookback: int = UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    start_at: pd.Timestamp | None = None,
 ) -> tuple[list[dict], pd.Series]:
     events: list[tuple[pd.Timestamp, str, int]] = []
     for ticker, df in frames.items():
@@ -212,28 +267,117 @@ def simulate_portfolio(
     trades: list[dict] = []
     equity_ts: dict[pd.Timestamp, float] = {}
     last_close: dict[str, float] = {}
+    active_universe = set(frames.keys())
+    daily_universe_cache: dict[pd.Timestamp, set[str]] = {}
 
     for ts, ticker, i in events:
+        if start_at is not None and ts < start_at:
+            continue
         df = frames[ticker]
         c = df.iloc[i]
         p = df.iloc[i - 1]
-        cfg = configs[ticker]
+        cfg = configs.get(ticker, get_strategy_config(ticker))
         last_close[ticker] = float(c["close"])
+
+        if dynamic_universe and universe_mode == "daily":
+            day = pd.Timestamp(ts).normalize()
+            if day not in daily_universe_cache:
+                daily_universe_cache[day] = set(
+                    select_daily_universe_from_frames(
+                        frames,
+                        day,
+                        limit=universe_limit,
+                    )
+                )
+            active_universe = daily_universe_cache[day]
+        elif dynamic_universe:
+            active_universe = set(
+                select_universe_from_frames(
+                    frames,
+                    ts,
+                    limit=universe_limit,
+                    lookback=universe_lookback,
+                )
+            )
 
         equity = cash + sum(pos["qty"] * last_close.get(t, pos["entry_price"]) for t, pos in positions.items())
         equity_ts[ts] = equity
 
         if ticker in positions:
             pos = positions[ticker]
-            exit_price, reason = exit_signal(
+            exit_price, reason, armed, highest, overbought_seen, bb_break_seen = exit_signal(
                 c,
                 entry_price=pos["entry_price"],
+                previous=p,
                 entry_time=pos["entry_time"],
                 current_time=ts,
+                partial_taken=pos.get("partial_taken", False),
+                bb_break_seen=pos.get("bb_break_seen", False),
+                overbought_seen=pos.get("overbought_seen", False),
                 config=cfg,
                 use_ohlc=True,
+                take_profit_armed=pos.get("take_profit_armed", False),
+                highest_price=pos.get("highest_price", pos["entry_price"]),
             )
+            pos["take_profit_armed"] = armed
+            pos["highest_price"] = highest
+            pos["overbought_seen"] = overbought_seen
+            pos["bb_break_seen"] = bb_break_seen
             if exit_price is None:
+                continue
+
+            if reason.startswith("PARTIAL_TAKE_PROFIT_50"):
+                fill_price = exit_price * (1 - slippage)
+                sell_qty = pos["qty"] * 0.5
+                proceeds = sell_qty * fill_price
+                sell_fee = proceeds * (fee / 2)
+                cash += proceeds - sell_fee
+                realized_invest = pos["invest_krw"] * 0.5
+                pnl_krw = proceeds - sell_fee - realized_invest
+                trades.append(
+                    {
+                        "ticker": ticker,
+                        "entry_time": pos["entry_time"],
+                        "exit_time": ts,
+                        "entry_price": pos["entry_price"],
+                        "exit_price": fill_price,
+                        "invest_krw": realized_invest,
+                        "pnl": pnl_krw / realized_invest if realized_invest > 0 else 0.0,
+                        "pnl_krw": pnl_krw,
+                        "reason": "PARTIAL_TAKE_PROFIT_50",
+                        "signal": pos["signal"],
+                    }
+                )
+                pos["qty"] = pos["qty"] - sell_qty
+                pos["invest_krw"] = realized_invest
+                pos["partial_taken"] = True
+                pos["take_profit_armed"] = True
+                pos["overbought_seen"] = overbought_seen
+                continue
+            if reason.startswith("PARTIAL_TAKE_PROFIT_25_BB_REV"):
+                fill_price = exit_price * (1 - slippage)
+                sell_qty = pos["qty"] * 0.5
+                proceeds = sell_qty * fill_price
+                sell_fee = proceeds * (fee / 2)
+                cash += proceeds - sell_fee
+                realized_invest = pos["invest_krw"] * 0.5
+                pnl_krw = proceeds - sell_fee - realized_invest
+                trades.append(
+                    {
+                        "ticker": ticker,
+                        "entry_time": pos["entry_time"],
+                        "exit_time": ts,
+                        "entry_price": pos["entry_price"],
+                        "exit_price": fill_price,
+                        "invest_krw": realized_invest,
+                        "pnl": pnl_krw / realized_invest if realized_invest > 0 else 0.0,
+                        "pnl_krw": pnl_krw,
+                        "reason": "PARTIAL_TAKE_PROFIT_25_BB_REV",
+                        "signal": pos["signal"],
+                    }
+                )
+                pos["qty"] = pos["qty"] - sell_qty
+                pos["invest_krw"] = realized_invest
                 continue
 
             fill_price = exit_price * (1 - slippage)
@@ -262,6 +406,9 @@ def simulate_portfolio(
                 cooldowns[ticker] = pd.Timestamp(cooldown_until_after_loss(ts, cfg))
             continue
 
+        if ticker not in active_universe:
+            continue
+
         if len(positions) >= MAX_CONCURRENT or not cfg.enabled:
             continue
         ok, reason = entry_signal(
@@ -271,16 +418,20 @@ def simulate_portfolio(
             config=cfg,
             cooldown_until=cooldowns.get(ticker),
             now=ts,
+            market_current=_market_row(frames, ts),
         )
         if not ok:
             continue
 
         next_open = float(df.iloc[i + 1]["open"]) * (1 + slippage)
-        invest_krw = min(equity * PER_TRADE_RATIO, cash)
+        stop_price = adaptive_stop_price(next_open, c, cfg)
+        trade_ratio = PER_TRADE_RATIO_SPIKE if "ENTRY:PRIMARY_SPIKE" in reason else PER_TRADE_RATIO
+        invest_krw = min(cash, equity * trade_ratio)
+        qty = invest_krw / next_open if next_open > 0 else 0.0
         if invest_krw < 5_000:
             continue
         buy_fee = invest_krw * (fee / 2)
-        qty = (invest_krw - buy_fee) / next_open
+        qty = max((invest_krw - buy_fee) / next_open, 0.0)
         cash -= invest_krw
         positions[ticker] = {
             "entry_price": next_open,
@@ -288,6 +439,12 @@ def simulate_portfolio(
             "invest_krw": invest_krw,
             "qty": qty,
             "signal": reason.split("]", 1)[0].replace("[", ""),
+            "stop_price": stop_price,
+            "highest_price": next_open,
+            "take_profit_armed": False,
+            "partial_taken": False,
+            "bb_break_seen": False,
+            "overbought_seen": False,
         }
 
     if positions:
@@ -317,6 +474,348 @@ def simulate_portfolio(
         equity_ts[final_ts] = cash
 
     return trades, pd.Series(equity_ts, name="equity", dtype=float).sort_index()
+
+
+def select_universe_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    *,
+    limit: int = UNIVERSE_TOP_N,
+    lookback: int = UNIVERSE_DAILY_LOOKBACK_MINUTES,
+) -> list[str]:
+    ranked: list[tuple[str, float]] = []
+    for ticker, df in frames.items():
+        if ticker in EXCLUDED_TICKERS:
+            continue
+        window = df.loc[df.index <= ts].tail(lookback)
+        volume = quote_volume_krw(window)
+        if volume >= UNIVERSE_MIN_DAILY_QUOTE_KRW:
+            ranked.append((ticker, volume))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    top30 = [ticker for ticker, _ in ranked[:30]]
+    noise_filtered = _noise_ratio_filter_from_frames(frames, ts, top30, threshold=UNIVERSE_NOISE_THRESHOLD)
+    atr_filtered = _exclude_high_atr_pct_from_frames(
+        frames,
+        ts,
+        noise_filtered,
+        exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+    )
+    beta_top = _beta_top_from_frames(frames, ts, atr_filtered, topn=UNIVERSE_BETA_TOP_N)
+    if beta_top:
+        return beta_top[:limit]
+    return atr_filtered[:limit]
+
+
+def select_daily_universe_from_frames(
+    frames: dict[str, pd.DataFrame],
+    day: pd.Timestamp,
+    *,
+    limit: int = UNIVERSE_TOP_N,
+) -> list[str]:
+    """Select TOP N by previous completed day's quote volume to avoid lookahead."""
+    current_day = pd.Timestamp(day).normalize()
+    previous_day = current_day - pd.Timedelta(days=1)
+    ranked: list[tuple[str, float]] = []
+    for ticker, df in frames.items():
+        if ticker in EXCLUDED_TICKERS:
+            continue
+        window = df.loc[(df.index >= previous_day) & (df.index < current_day)]
+        volume = quote_volume_krw(window)
+        if volume >= UNIVERSE_MIN_DAILY_QUOTE_KRW:
+            ranked.append((ticker, volume))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    top30 = [ticker for ticker, _ in ranked[:30]]
+    noise_filtered = _noise_ratio_filter_from_day(frames, current_day, top30, threshold=UNIVERSE_NOISE_THRESHOLD)
+    atr_filtered = _exclude_high_atr_pct_from_day(
+        frames,
+        current_day,
+        noise_filtered,
+        exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+    )
+    beta_top = _beta_top_from_day(frames, current_day, atr_filtered, topn=UNIVERSE_BETA_TOP_N)
+    if beta_top:
+        return beta_top[:limit]
+    return atr_filtered[:limit]
+
+
+def count_daily_universe_membership(
+    frames: dict[str, pd.DataFrame],
+    start_at: pd.Timestamp,
+    end_at: pd.Timestamp,
+    *,
+    limit: int = UNIVERSE_TOP_N,
+) -> dict[str, int]:
+    counts = {ticker: 0 for ticker in frames}
+    for day in pd.date_range(pd.Timestamp(start_at).normalize(), pd.Timestamp(end_at).normalize(), freq="D"):
+        for ticker in select_daily_universe_from_frames(frames, day, limit=limit):
+            counts[ticker] = counts.get(ticker, 0) + 1
+    return {ticker: count for ticker, count in counts.items() if count > 0}
+
+
+def _market_row(frames: dict[str, pd.DataFrame], ts: pd.Timestamp) -> pd.Series | None:
+    btc = frames.get("KRW-BTC")
+    if btc is None:
+        return None
+    window = btc.loc[btc.index <= ts]
+    if window.empty:
+        return None
+    return window.iloc[-1]
+
+
+def _volume_surge_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    *,
+    candidates: list[str],
+) -> list[tuple[str, float]]:
+    scored: list[tuple[str, float]] = []
+    end = pd.Timestamp(ts)
+    split = end - pd.Timedelta(hours=24)
+    start = end - pd.Timedelta(hours=48)
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        prev_window = df.loc[(df.index > start) & (df.index <= split)]
+        curr_window = df.loc[(df.index > split) & (df.index <= end)]
+        prev_vol = quote_volume_krw(prev_window)
+        curr_vol = quote_volume_krw(curr_window)
+        if prev_vol <= 0:
+            continue
+        scored.append((ticker, (curr_vol - prev_vol) / prev_vol))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
+def _volume_surge_from_day(
+    frames: dict[str, pd.DataFrame],
+    current_day: pd.Timestamp,
+    *,
+    candidates: list[str],
+) -> list[tuple[str, float]]:
+    scored: list[tuple[str, float]] = []
+    prev_day = current_day - pd.Timedelta(days=1)
+    prev2_day = current_day - pd.Timedelta(days=2)
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        prev2_window = df.loc[(df.index >= prev2_day) & (df.index < prev_day)]
+        prev_window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
+        prev2_vol = quote_volume_krw(prev2_window)
+        prev_vol = quote_volume_krw(prev_window)
+        if prev2_vol <= 0:
+            continue
+        scored.append((ticker, (prev_vol - prev2_vol) / prev2_vol))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
+def _beta_top_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    candidates: list[str],
+    *,
+    topn: int = 10,
+) -> list[str]:
+    btc = frames.get("KRW-BTC")
+    if btc is None:
+        return candidates[:topn]
+    btc_window = btc.loc[btc.index <= ts].tail(25)
+    if len(btc_window) < 25:
+        return candidates[:topn]
+    btc_ret = float(btc_window["close"].iloc[-1] / btc_window["close"].iloc[0] - 1)
+    scored: list[tuple[str, float]] = []
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[df.index <= ts].tail(25)
+        if len(window) < 25:
+            continue
+        ret = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1)
+        beta = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
+        scored.append((ticker, beta))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected = [ticker for ticker, beta in scored if beta >= UNIVERSE_BETA_MIN][:topn]
+    return selected or [ticker for ticker, _ in scored[:topn]]
+
+
+def _beta_top_from_day(
+    frames: dict[str, pd.DataFrame],
+    current_day: pd.Timestamp,
+    candidates: list[str],
+    *,
+    topn: int = 10,
+) -> list[str]:
+    btc = frames.get("KRW-BTC")
+    if btc is None:
+        return candidates[:topn]
+    prev_day = current_day - pd.Timedelta(days=1)
+    btc_window = btc.loc[(btc.index >= prev_day) & (btc.index < current_day)]
+    if len(btc_window) < 2:
+        return candidates[:topn]
+    btc_ret = float(btc_window["close"].iloc[-1] / btc_window["close"].iloc[0] - 1)
+    scored: list[tuple[str, float]] = []
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
+        if len(window) < 2:
+            continue
+        ret = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1)
+        beta = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
+        scored.append((ticker, beta))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected = [ticker for ticker, beta in scored if beta >= UNIVERSE_BETA_MIN][:topn]
+    return selected or [ticker for ticker, _ in scored[:topn]]
+
+
+def _rsi_momentum_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    *,
+    candidates: list[str],
+    topn: int = 5,
+) -> list[tuple[str, float]]:
+    scored: list[tuple[str, float]] = []
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[df.index <= ts]
+        if len(window) < 4 or "rsi" not in window:
+            continue
+        now_rsi = float(window.iloc[-1]["rsi"])
+        prev_rsi = float(window.iloc[-4]["rsi"])
+        if pd.notna(now_rsi) and pd.notna(prev_rsi):
+            scored.append((ticker, now_rsi - prev_rsi))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[:topn]
+
+
+def _rsi_momentum_from_day(
+    frames: dict[str, pd.DataFrame],
+    current_day: pd.Timestamp,
+    *,
+    candidates: list[str],
+    topn: int = 5,
+) -> list[tuple[str, float]]:
+    scored: list[tuple[str, float]] = []
+    prev_day = current_day - pd.Timedelta(days=1)
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
+        if len(window) < 4 or "rsi" not in window:
+            continue
+        now_rsi = float(window.iloc[-1]["rsi"])
+        prev_rsi = float(window.iloc[-4]["rsi"])
+        if pd.notna(now_rsi) and pd.notna(prev_rsi):
+            scored.append((ticker, now_rsi - prev_rsi))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[:topn]
+
+
+def _exclude_high_atr_pct_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    candidates: list[str],
+    *,
+    exclude_ratio: float = 0.10,
+) -> list[str]:
+    """B안: 후보군에서 ATR% 상위 일부(기본 10%)를 제외해 급변동 리스크를 낮춘다."""
+    scored: list[tuple[str, float]] = []
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[df.index <= ts].tail(24)
+        if window.empty or "atr_pct" not in window:
+            continue
+        atr_pct = float(window["atr_pct"].mean())
+        if pd.notna(atr_pct) and atr_pct > 0:
+            scored.append((ticker, atr_pct))
+    if not scored:
+        return candidates
+
+    remove_count = max(1, int(len(scored) * exclude_ratio))
+    high_atr = {ticker for ticker, _ in sorted(scored, key=lambda item: item[1], reverse=True)[:remove_count]}
+    filtered = [ticker for ticker in candidates if ticker not in high_atr]
+    return filtered or candidates
+
+
+def _exclude_high_atr_pct_from_day(
+    frames: dict[str, pd.DataFrame],
+    current_day: pd.Timestamp,
+    candidates: list[str],
+    *,
+    exclude_ratio: float = 0.10,
+) -> list[str]:
+    scored: list[tuple[str, float]] = []
+    prev_day = current_day - pd.Timedelta(days=1)
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
+        if window.empty or "atr_pct" not in window:
+            continue
+        atr_pct = float(window["atr_pct"].mean())
+        if pd.notna(atr_pct) and atr_pct > 0:
+            scored.append((ticker, atr_pct))
+    if not scored:
+        return candidates
+
+    remove_count = max(1, int(len(scored) * exclude_ratio))
+    high_atr = {ticker for ticker, _ in sorted(scored, key=lambda item: item[1], reverse=True)[:remove_count]}
+    filtered = [ticker for ticker in candidates if ticker not in high_atr]
+    return filtered or candidates
+
+
+def _noise_ratio_filter_from_frames(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    candidates: list[str],
+    *,
+    threshold: float = 0.6,
+) -> list[str]:
+    kept: list[str] = []
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[df.index <= ts].tail(24)
+        if window.empty:
+            continue
+        noise = price_noise_pct(window)
+        if noise < threshold:
+            kept.append(ticker)
+    return kept or candidates
+
+
+def _noise_ratio_filter_from_day(
+    frames: dict[str, pd.DataFrame],
+    current_day: pd.Timestamp,
+    candidates: list[str],
+    *,
+    threshold: float = 0.6,
+) -> list[str]:
+    kept: list[str] = []
+    prev_day = current_day - pd.Timedelta(days=1)
+    for ticker in candidates:
+        df = frames.get(ticker)
+        if df is None:
+            continue
+        window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
+        if window.empty:
+            continue
+        noise = price_noise_pct(window)
+        if noise < threshold:
+            kept.append(ticker)
+    return kept or candidates
 
 
 def metrics(trades: list[dict], equity: pd.Series, df: pd.DataFrame | None = None) -> dict:
@@ -361,75 +860,11 @@ def monthly_returns(trades: list[dict]) -> pd.Series:
     return tdf.groupby("month")["pnl"].sum()
 
 
-def validate_ticker(df: pd.DataFrame, ticker: str) -> tuple[StrategyConfig, dict, dict, bool]:
-    base = replace(get_strategy_config(ticker), enabled=True)
-    split = max(int(len(df) * TRAIN_RATIO), 1)
-    train = df.iloc[:split]
-    validation = df.iloc[split:]
-
-    candidates = [
-        base,
-        replace(
-            base,
-            take_profit=1.0,
-            stop_loss=0.50,
-            hard_stop_factor=0.0,
-            bb_mid_min_profit=1.0,
-            max_hold_minutes=1_000_000,
-            cooldown_minutes=120,
-            volatility_breakout_enabled=True,
-            mean_reversion_enabled=False,
-            breakout_k=1.0,
-            breakout_volume_multiplier=1.5,
-            breakout_rsi_min=45,
-            breakout_rsi_max=65,
-            recovery_return_30d_max=-0.10,
-            momentum_return_30d_min=0.03,
-        ),
-    ]
-
-    base_trades, base_eq = simulate_ticker(validation, ticker=ticker, config=base)
-    base_m = metrics(base_trades, base_eq, validation)
-
-    best_cfg = candidates[0]
-    best_m = base_m
-    best_score = -float("inf")
-    for cfg in candidates:
-        trades, eq = simulate_ticker(validation, ticker=ticker, config=cfg)
-        m = metrics(trades, eq, validation)
-        score = m["return"] - abs(m["mdd"]) + min(m["profit_factor"], 3.0) * 0.01
-        if m["trades"] >= 1 and score > best_score:
-            best_cfg = cfg
-            best_m = m
-
-    best_trades, best_eq = simulate_ticker(validation, ticker=ticker, config=best_cfg)
-    best_m = metrics(best_trades, best_eq, validation)
-
-    year_factor = 365 / max((validation.index[-1] - validation.index[0]).days, 1)
-    trades_per_year = best_m["trades"] * year_factor
-    mdd_improved = abs(best_m["mdd"]) <= abs(base_m["mdd"]) * 0.5 if base_m["mdd"] < 0 else True
-    passed = (
-        best_m["return"] > 0
-        and best_m["profit_factor"] > 1.0
-        and mdd_improved
-        and trades_per_year >= 3
-        and best_m["avg_pnl"] > 0
-    )
-    if not passed and get_strategy_config(ticker).strategic_accumulation_enabled:
-        full_trades, full_eq = simulate_ticker(df, ticker=ticker, config=get_strategy_config(ticker))
-        full_m = metrics(full_trades, full_eq, df)
-        if full_m["return"] > 0 and full_m["avg_pnl"] > 0:
-            best_cfg = get_strategy_config(ticker)
-            best_m = full_m
-            passed = True
-    return best_cfg, base_m, best_m, passed
-
-
-def print_ticker_report(ticker: str, trades: list[dict], equity: pd.Series, df: pd.DataFrame, passed: bool) -> None:
+def print_ticker_report(ticker: str, trades: list[dict], equity: pd.Series, df: pd.DataFrame) -> None:
     m = metrics(trades, equity, df)
     bnh_ret = df["close"].iloc[-1] / df["close"].iloc[0] - 1
     print("\n" + "=" * 72)
-    print(f"{ticker} - strategy.py signal-engine backtest ({'ENABLED' if passed else 'DISABLED'})")
+    print(f"{ticker} - 1h trend pullback signal-engine backtest")
     print("=" * 72)
     print(f"period         : {df.index[0].date()} -> {df.index[-1].date()} ({len(df):,} candles)")
     print(f"trades         : {m['trades']}")
@@ -444,7 +879,12 @@ def print_ticker_report(ticker: str, trades: list[dict], equity: pd.Series, df: 
         print("exit reasons   : " + ", ".join(f"{k}={v}" for k, v in tdf["reason"].value_counts().items()))
 
 
-def print_portfolio_report(trades: list[dict], equity: pd.Series) -> None:
+def print_portfolio_report(
+    trades: list[dict],
+    equity: pd.Series,
+    *,
+    daily_membership_counts: dict[str, int] | None = None,
+) -> None:
     print("\n" + "=" * 72)
     print("Portfolio backtest - bot sizing/concurrency")
     print("=" * 72)
@@ -468,47 +908,86 @@ def print_portfolio_report(trades: list[dict], equity: pd.Series) -> None:
         mr = monthly_returns(trades)
         if not mr.empty:
             print("monthly pnl sum : " + ", ".join(f"{idx}={val*100:+.2f}%" for idx, val in mr.items()))
+        print("exit reasons    : " + ", ".join(f"{k}={v}" for k, v in tdf["reason"].value_counts().items()))
+        print("entry signals   : " + ", ".join(f"{k}={v}" for k, v in tdf["signal"].value_counts().items()))
+    if daily_membership_counts:
+        ranked = sorted(daily_membership_counts.items(), key=lambda item: item[1], reverse=True)
+        print("daily TOP10 days: " + ", ".join(f"{ticker}={count}" for ticker, count in ranked[:20]))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=int, default=0, help="Use only the last N candles per ticker for a fast smoke run.")
+    parser.add_argument("--days", type=int, default=0, help="Evaluate only the most recent N days after indicator warmup.")
+    parser.add_argument(
+        "--universe-mode",
+        choices=["hourly", "daily"],
+        default="hourly",
+        help="Dynamic universe ranking cadence. daily uses previous completed day quote-volume TOP N.",
+    )
     parser.add_argument("--refresh-cache", action="store_true", help="Refresh OHLCV cache from Upbit before running.")
+    parser.add_argument(
+        "--tickers",
+        default="",
+        help="Comma-separated KRW tickers to backtest. Defaults to every Upbit KRW market.",
+    )
+    parser.add_argument(
+        "--static-default",
+        action="store_true",
+        help="Use the legacy 5 fixed tickers instead of dynamic KRW-market discovery.",
+    )
     args = parser.parse_args()
 
     frames: dict[str, pd.DataFrame] = {}
     configs: dict[str, StrategyConfig] = {}
-    pass_map: dict[str, bool] = {}
+    skipped: list[str] = []
 
-    for ticker in TICKERS:
+    if args.tickers:
+        tickers = [ticker.strip() for ticker in args.tickers.split(",") if ticker.strip()]
+    elif args.static_default:
+        tickers = DEFAULT_TICKERS
+    else:
+        tickers = get_krw_tickers()
+
+    for ticker in tickers:
         raw = fetch_year_of_data(ticker, refresh_cache=args.refresh_cache)
         if raw.empty or len(raw) < 1_000:
             print(f"[{ticker}] insufficient data - skipped")
+            skipped.append(ticker)
             continue
-        if args.sample:
-            raw = raw.tail(args.sample)
         df = add_indicators(raw)
+        if args.sample:
+            df = df.tail(args.sample)
         frames[ticker] = df
+        configs[ticker] = get_strategy_config(ticker)
 
-        cfg, base_m, val_m, passed = validate_ticker(df, ticker)
-        pass_map[ticker] = passed
-        configs[ticker] = replace(cfg, enabled=passed)
-        print(
-            f"[{ticker}] validation gate: {'PASS' if passed else 'FAIL'} "
-            f"(PF {val_m['profit_factor']:.2f}, MDD {val_m['mdd']*100:.2f}%, "
-            f"trades {val_m['trades']}, avg {val_m['avg_pnl']*100:+.3f}%; "
-            f"baseline PF {base_m['profit_factor']:.2f})"
-        )
-
-        trades, equity = simulate_ticker(df, ticker=ticker, config=configs[ticker])
-        print_ticker_report(ticker, trades, equity, df, passed)
+        start_at = df.index[-1] - pd.Timedelta(days=args.days) if args.days else None
+        trades, equity = simulate_ticker(df, ticker=ticker, config=configs[ticker], start_at=start_at)
+        print_ticker_report(ticker, trades, equity, df)
 
     if frames:
-        trades, equity = simulate_portfolio(frames, configs)
-        print_portfolio_report(trades, equity)
-        disabled = [ticker for ticker, passed in pass_map.items() if not passed]
-        if disabled:
-            print("\nValidation-disabled tickers: " + ", ".join(disabled))
+        final_ts = max(df.index[-1] for df in frames.values())
+        start_at = final_ts - pd.Timedelta(days=args.days) if args.days else None
+        trades, equity = simulate_portfolio(
+            frames,
+            configs,
+            dynamic_universe=True,
+            universe_mode=args.universe_mode,
+            universe_limit=UNIVERSE_TOP_N,
+            start_at=start_at,
+        )
+        daily_membership_counts = (
+            count_daily_universe_membership(frames, start_at or final_ts, final_ts)
+            if args.universe_mode == "daily"
+            else None
+        )
+        print_portfolio_report(
+            trades,
+            equity,
+            daily_membership_counts=daily_membership_counts,
+        )
+        if skipped:
+            print(f"skipped tickers  : {len(skipped)}")
 
 
 if __name__ == "__main__":
