@@ -70,12 +70,24 @@ def test_telegram_due_only_at_hour():
     state = {"last_telegram_slot": None}
 
     assert bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 0, 5))
+    assert bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 4, 59))
     assert not bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 30, 5))
-    assert not bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 1, 5))
+    assert bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 1, 5))
+    assert not bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 5, 0))
     assert not bot.telegram_due(
         {"last_telegram_slot": "2026-01-01 09:00"},
         now=datetime(2026, 1, 1, 9, 0, 10),
     )
+    assert not bot.telegram_due(
+        {"last_telegram_slot": "2026-01-01 09:00"},
+        now=datetime(2026, 1, 1, 9, 4, 59),
+    )
+
+
+def test_current_telegram_slot_uses_hour_slot_with_grace():
+    assert bot.current_telegram_slot(datetime(2026, 1, 1, 9, 0, 5)) == "2026-01-01 09:00"
+    assert bot.current_telegram_slot(datetime(2026, 1, 1, 9, 4, 59)) == "2026-01-01 09:00"
+    assert bot.current_telegram_slot(datetime(2026, 1, 1, 9, 5, 0)) is None
 
 
 def test_seconds_to_next_hour(monkeypatch):

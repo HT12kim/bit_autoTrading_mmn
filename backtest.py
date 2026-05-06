@@ -9,6 +9,8 @@ live trading and research cannot drift apart.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import pickle
 import time
 from datetime import datetime, timedelta
@@ -17,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import pyupbit
 
+import strategy
 from bot import (
     EXCLUDED_TICKERS,
     MAX_CONCURRENT,
@@ -58,6 +61,7 @@ INITIAL_KRW = 1_000_000
 FEE = 0.001  # Upbit 0.05% buy + 0.05% sell
 SLIPPAGE = DEFAULT_SLIPPAGE
 INDICATOR_CACHE_VERSION = 2
+SIGNAL_TICKER_CACHE_VERSION = 1
 
 
 def _cache_path(ticker: str) -> Path:
@@ -66,6 +70,165 @@ def _cache_path(ticker: str) -> Path:
 
 def _indicator_cache_path(ticker: str) -> Path:
     return Path(f"indicator_cache_{ticker.replace('-', '_')}_{INTERVAL}_v{INDICATOR_CACHE_VERSION}.pkl")
+
+
+def _signal_ticker_cache_path(cache_key: str) -> Path:
+    return Path(f"signal_tickers_{cache_key}_v{SIGNAL_TICKER_CACHE_VERSION}.pkl")
+
+
+def _signal_ticker_cache_key(
+    *,
+    start_at: pd.Timestamp,
+    end_at: pd.Timestamp,
+    universe_mode: str,
+    universe_limit: int,
+    universe_lookback: int,
+    min_quote_volume_krw: float,
+    noise_threshold: float,
+    atr_exclude_ratio: float,
+    beta_min: float,
+    beta_top_n: int,
+) -> str:
+    payload = {
+        "start": str(pd.Timestamp(start_at)),
+        "end": str(pd.Timestamp(end_at)),
+        "universe_mode": universe_mode,
+        "universe_limit": universe_limit,
+        "universe_lookback": universe_lookback,
+        "min_quote_volume_krw": min_quote_volume_krw,
+        "noise_threshold": noise_threshold,
+        "atr_exclude_ratio": atr_exclude_ratio,
+        "beta_min": beta_min,
+        "beta_top_n": beta_top_n,
+        "strategy": {
+            "SECONDARY_RSI_LEVEL": strategy.SECONDARY_RSI_LEVEL,
+            "PRIMARY_VOLUME_SPIKE_MULTIPLIER": strategy.PRIMARY_VOLUME_SPIKE_MULTIPLIER,
+            "ENTRY_RSI_MAX": strategy.ENTRY_RSI_MAX,
+            "VOLUME_PULLBACK_MULTIPLIER": strategy.VOLUME_PULLBACK_MULTIPLIER,
+            "MARKET_RSI_MIN": strategy.MARKET_RSI_MIN,
+            "ATR_STOP_MULTIPLIER": strategy.ATR_STOP_MULTIPLIER,
+            "TAKE_PROFIT_ARM_PNL": strategy.TAKE_PROFIT_ARM_PNL,
+            "TRAILING_TAKE_PROFIT_DRAWDOWN": strategy.TRAILING_TAKE_PROFIT_DRAWDOWN,
+            "TRAILING_STEP_UP_PNL": strategy.TRAILING_STEP_UP_PNL,
+            "TRAILING_STEP_UP_DRAWDOWN": strategy.TRAILING_STEP_UP_DRAWDOWN,
+            "VWAP_EXIT_BUFFER": strategy.VWAP_EXIT_BUFFER,
+            "VWAP_EXIT_LOCKED_PROFIT_BUFFER": strategy.VWAP_EXIT_LOCKED_PROFIT_BUFFER,
+            "TIME_CUT_BARS": strategy.TIME_CUT_BARS,
+            "TIME_CUT_MIN_PNL": strategy.TIME_CUT_MIN_PNL,
+            "FAST_TIME_CUT_BARS": strategy.FAST_TIME_CUT_BARS,
+            "FAST_TIME_CUT_MIN_PNL": strategy.FAST_TIME_CUT_MIN_PNL,
+            "DEAD_CROSS_EXIT_ENABLED": strategy.DEAD_CROSS_EXIT_ENABLED,
+            "BB_REV_PARTIAL_EXIT_ENABLED": strategy.BB_REV_PARTIAL_EXIT_ENABLED,
+        },
+        "portfolio": {
+            "MAX_CONCURRENT": MAX_CONCURRENT,
+            "PER_TRADE_RATIO": PER_TRADE_RATIO,
+            "PER_TRADE_RATIO_SPIKE": PER_TRADE_RATIO_SPIKE,
+        },
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def build_signal_ticker_cache(
+    frames: dict[str, pd.DataFrame],
+    configs: dict[str, StrategyConfig],
+    *,
+    start_at: pd.Timestamp,
+    end_at: pd.Timestamp,
+    universe_mode: str,
+    universe_limit: int,
+    universe_lookback: int = UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    use_cache: bool = True,
+) -> set[str]:
+    cache_key = _signal_ticker_cache_key(
+        start_at=start_at,
+        end_at=end_at,
+        universe_mode=universe_mode,
+        universe_limit=universe_limit,
+        universe_lookback=universe_lookback,
+        min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+        noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+        atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+        beta_min=UNIVERSE_BETA_MIN,
+        beta_top_n=UNIVERSE_BETA_TOP_N,
+    )
+    cache_path = _signal_ticker_cache_path(cache_key)
+    if use_cache and cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, set):
+                return cached
+        except Exception:
+            pass
+
+    signal_tickers: set[str] = {"KRW-BTC"}
+    daily_universe_cache: dict[pd.Timestamp, set[str]] = {}
+    hourly_universe_cache: dict[pd.Timestamp, set[str]] = {}
+
+    for ticker, df in frames.items():
+        if ticker == "KRW-BTC":
+            continue
+        cfg = configs.get(ticker, get_strategy_config(ticker))
+        for i in range(1, len(df) - 1):
+            ts = df.index[i]
+            if ts < start_at or ts > end_at:
+                continue
+
+            if universe_mode == "daily":
+                day = pd.Timestamp(ts).normalize()
+                if day not in daily_universe_cache:
+                    daily_universe_cache[day] = set(
+                        select_daily_universe_from_frames(
+                            frames,
+                            day,
+                            limit=universe_limit,
+                            min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+                            noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+                            atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+                            beta_min=UNIVERSE_BETA_MIN,
+                            beta_top_n=UNIVERSE_BETA_TOP_N,
+                        )
+                    )
+                active_universe = daily_universe_cache[day]
+            else:
+                candle_ts = pd.Timestamp(ts)
+                if candle_ts not in hourly_universe_cache:
+                    hourly_universe_cache[candle_ts] = set(
+                        select_universe_from_frames(
+                            frames,
+                            candle_ts,
+                            limit=universe_limit,
+                            lookback=universe_lookback,
+                            min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+                            noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+                            atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+                            beta_min=UNIVERSE_BETA_MIN,
+                            beta_top_n=UNIVERSE_BETA_TOP_N,
+                        )
+                    )
+                active_universe = hourly_universe_cache[candle_ts]
+
+            if ticker not in active_universe:
+                continue
+
+            ok, _ = entry_signal(
+                df.iloc[i],
+                df.iloc[i - 1],
+                ticker=ticker,
+                config=cfg,
+                now=ts,
+                market_current=_market_row(frames, ts),
+            )
+            if ok:
+                signal_tickers.add(ticker)
+                break
+
+    if use_cache:
+        with open(cache_path, "wb") as f:
+            pickle.dump(signal_tickers, f)
+    return signal_tickers
 
 
 def fetch_year_of_data(ticker: str, *, refresh_cache: bool = False) -> pd.DataFrame:
@@ -1153,6 +1316,16 @@ def main() -> None:
     if frames:
         final_ts = max(df.index[-1] for df in frames.values())
         start_at = final_ts - pd.Timedelta(days=args.days) if args.days else None
+        event_tickers = None
+        if start_at is not None:
+            event_tickers = build_signal_ticker_cache(
+                frames,
+                configs,
+                start_at=start_at,
+                end_at=final_ts,
+                universe_mode=args.universe_mode,
+                universe_limit=UNIVERSE_TOP_N,
+            )
         trades, equity = simulate_portfolio(
             frames,
             configs,
@@ -1160,6 +1333,7 @@ def main() -> None:
             universe_mode=args.universe_mode,
             universe_limit=UNIVERSE_TOP_N,
             start_at=start_at,
+            event_tickers=event_tickers,
         )
         daily_membership_counts = (
             count_daily_universe_membership(frames, start_at or final_ts, final_ts)

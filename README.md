@@ -56,7 +56,7 @@ PYTHONPYCACHEPREFIX=.pycache_compile .venv/bin/python -m py_compile bot.py strat
 - [bot.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/bot.py): 실거래 루프, 주문, 리스크 관리, 텔레그램 알림
 - [strategy.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/strategy.py): 지표 계산, 진입/청산 규칙, 최종 튜닝 프로파일
 - [universe.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/universe.py): 유니버스 후보 생성 및 필터링
-- [backtest.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/backtest.py): 1년치 백테스트, 캐시 재사용, 포트폴리오 시뮬레이션
+- [backtest.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/backtest.py): 1년치 백테스트, 캐시 재사용, `signal_tickers` 캐시 기반 포트폴리오 시뮬레이션
 
 ## 최근 검증 결과
 
@@ -71,5 +71,5 @@ PYTHONPYCACHEPREFIX=.pycache_compile .venv/bin/python -m py_compile bot.py strat
 ## 주의 사항
 
 - 실거래 코드는 실제 주문을 전송합니다.
-- 백테스트 캐시 파일(`data_cache_*`, `indicator_cache_*`)은 대용량이므로 보통 커밋하지 않습니다.
+- 백테스트 캐시 파일(`data_cache_*`, `indicator_cache_*`, `signal_tickers_*`)은 대용량/생성 산출물이므로 보통 커밋하지 않습니다.
 - 전략 파라미터는 [strategy.py](/Users/ht_mac_mini/Documents/dev/git_btc_inv/btc_inv-claude-add-claude-documentation-6Gajn/strategy.py)의 `FINAL_TUNED_PROFILE`에서 관리합니다.

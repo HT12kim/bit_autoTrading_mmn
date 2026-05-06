@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-bot.py — 실시간 거래대금 TOP 10 1시간봉 눌림목 전략 봇 (Upbit)
+bot.py — 실시간 거래대금 TOP 10 1시간봉 저빈도 추세 전략 봇 (Upbit)
 
-종목: KRW-USDT 제외 업비트 KRW 마켓 최근 1시간 거래대금 상위 10개
-전략: BTC MA20/RSI 시장 필터 + BB 하단 재진입 + RSI30 재돌파 + 거래량 확인
+종목: KRW-USDT 제외 업비트 KRW 마켓 혼합 유니버스 상위 10개
+전략: BTC 시장 필터 + PRIMARY 중심 눌림목 추세 진입
 리스크: 일일 -2% 거래 중지 / 5연속 손실 1시간 휴식
 상태: state.json 영속화 (재시작 안전)
 """
@@ -70,6 +70,7 @@ MIN_ORDER_KRW         = 5_000
 LIMIT_ORDER_TIMEOUT_SEC = 10
 ORDER_RETRY_COUNT     = 3
 STATE_FILE            = "state.json"
+TELEGRAM_SLOT_GRACE_MINUTES = 5
 
 
 # ── Upbit 인증 ─────────────────────────────────────────────────────────────────
@@ -353,13 +354,21 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def current_telegram_slot(now: datetime | None = None) -> str | None:
+    """정시 직후 몇 분까지를 같은 정각 알림 슬롯으로 본다."""
+    now = now or datetime.now()
+    if now.minute >= TELEGRAM_SLOT_GRACE_MINUTES:
+        return None
+    return now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+
+
 def telegram_due(state: dict, now: datetime | None = None) -> bool:
     now = now or datetime.now()
-    if now.minute != 0:
+    current_slot = current_telegram_slot(now)
+    if current_slot is None:
         return False
 
-    # 루프가 정각 이후 여러 번 실행되어도 같은 슬롯에는 1회만 전송한다.
-    current_slot = now.strftime("%Y-%m-%d %H:%M")
+    # 루프가 정각 직후 여러 번 실행되어도 같은 슬롯에는 1회만 전송한다.
     return state.get("last_telegram_slot") != current_slot
 
 
@@ -443,7 +452,7 @@ def maybe_send_hourly_status(
 
     message = build_status_message(upbit, state, equity, risk_reason=risk_reason)
     if send_telegram_message(message):
-        state["last_telegram_slot"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        state["last_telegram_slot"] = current_telegram_slot() or datetime.now().strftime("%Y-%m-%d %H:%M")
         log.info("텔레그램 정기 알림 전송 완료")
 
 
@@ -742,6 +751,7 @@ def main() -> None:
                 continue
 
             active_universe = refresh_active_universe(state)
+            maybe_send_hourly_status(upbit, state, equity, risk_reason=risk_reason)
             btc_df = fetch_df("KRW-BTC")
 
             # ── 보유 포지션 청산 검토 ──────────────────────────────────────────────
@@ -984,7 +994,6 @@ def main() -> None:
                 len(state["positions"]),
                 state["consecutive_losses"],
             )
-            maybe_send_hourly_status(upbit, state, equity, risk_reason=risk_reason)
             save_state(state)
     except KeyboardInterrupt:
         log.info("사용자 종료 요청(Ctrl+C) — 봇을 종료합니다.")
