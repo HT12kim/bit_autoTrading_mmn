@@ -27,6 +27,7 @@ from bot import (
 from strategy import (
     DEFAULT_SLIPPAGE,
     StrategyConfig,
+    activate_final_tuned_profile,
     add_indicators,
     adaptive_stop_price,
     cooldown_until_after_loss,
@@ -56,10 +57,15 @@ INTERVAL = "minute60"
 INITIAL_KRW = 1_000_000
 FEE = 0.001  # Upbit 0.05% buy + 0.05% sell
 SLIPPAGE = DEFAULT_SLIPPAGE
+INDICATOR_CACHE_VERSION = 2
 
 
 def _cache_path(ticker: str) -> Path:
     return Path(f"data_cache_{ticker.replace('-', '_')}_{INTERVAL}.pkl")
+
+
+def _indicator_cache_path(ticker: str) -> Path:
+    return Path(f"indicator_cache_{ticker.replace('-', '_')}_{INTERVAL}_v{INDICATOR_CACHE_VERSION}.pkl")
 
 
 def fetch_year_of_data(ticker: str, *, refresh_cache: bool = False) -> pd.DataFrame:
@@ -119,6 +125,49 @@ def fetch_year_of_data(ticker: str, *, refresh_cache: bool = False) -> pd.DataFr
     with open(cache, "wb") as f:
         pickle.dump(result, f)
     return result
+
+
+def load_indicator_frame(ticker: str, *, refresh_cache: bool = False) -> pd.DataFrame:
+    raw = fetch_year_of_data(ticker, refresh_cache=refresh_cache)
+    if raw.empty:
+        return pd.DataFrame()
+
+    raw_cache = _cache_path(ticker)
+    indicator_cache = _indicator_cache_path(ticker)
+    raw_mtime = raw_cache.stat().st_mtime if raw_cache.exists() else None
+
+    if indicator_cache.exists() and raw_mtime is not None:
+        try:
+            with open(indicator_cache, "rb") as f:
+                payload = pickle.load(f)
+            if (
+                isinstance(payload, dict)
+                and payload.get("raw_mtime") == raw_mtime
+                and isinstance(payload.get("frame"), pd.DataFrame)
+            ):
+                return payload["frame"]
+        except Exception:
+            pass
+
+    enriched = add_indicators(raw.sort_index())
+    enriched = add_backtest_universe_metrics(enriched)
+    if raw_mtime is not None:
+        with open(indicator_cache, "wb") as f:
+            pickle.dump({"raw_mtime": raw_mtime, "frame": enriched}, f)
+    return enriched
+
+
+def add_backtest_universe_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    quote_value = out["close"].astype(float) * out["volume"].astype(float)
+    out["quote_volume_24h"] = quote_value.rolling(24).sum()
+    prev_quote_volume_24h = out["quote_volume_24h"].shift(24)
+    out["surge_24h"] = (out["quote_volume_24h"] - prev_quote_volume_24h) / prev_quote_volume_24h
+    out["rsi_momentum_4"] = out["rsi"] - out["rsi"].shift(3)
+    out["noise_24h"] = ((out["high"].astype(float) - out["low"].astype(float)).abs() / out["close"].astype(float)).rolling(24).mean()
+    out["atr_pct_24h"] = out["atr_pct"].rolling(24).mean()
+    out["ret_24h"] = out["close"].astype(float) / out["close"].astype(float).shift(24) - 1
+    return out
 
 
 def simulate_ticker(
@@ -258,9 +307,13 @@ def simulate_portfolio(
     universe_limit: int = UNIVERSE_TOP_N,
     universe_lookback: int = UNIVERSE_VOLUME_LOOKBACK_MINUTES,
     start_at: pd.Timestamp | None = None,
+    hourly_universe_cache: dict[pd.Timestamp, set[str]] | None = None,
+    event_tickers: set[str] | None = None,
 ) -> tuple[list[dict], pd.Series]:
     events: list[tuple[pd.Timestamp, str, int]] = []
     for ticker, df in frames.items():
+        if event_tickers is not None and ticker not in event_tickers:
+            continue
         for i in range(1, len(df) - 1):
             events.append((df.index[i], ticker, i))
     events.sort(key=lambda x: x[0])
@@ -273,6 +326,7 @@ def simulate_portfolio(
     last_close: dict[str, float] = {}
     active_universe = set(frames.keys())
     daily_universe_cache: dict[pd.Timestamp, set[str]] = {}
+    hourly_cache = hourly_universe_cache or {}
 
     for ts, ticker, i in events:
         if start_at is not None and ts < start_at:
@@ -300,19 +354,22 @@ def simulate_portfolio(
                 )
             active_universe = daily_universe_cache[day]
         elif dynamic_universe:
-            active_universe = set(
-                select_universe_from_frames(
-                    frames,
-                    ts,
-                    limit=universe_limit,
-                    lookback=universe_lookback,
-                    min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
-                    noise_threshold=UNIVERSE_NOISE_THRESHOLD,
-                    atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
-                    beta_min=UNIVERSE_BETA_MIN,
-                    beta_top_n=UNIVERSE_BETA_TOP_N,
+            candle_ts = pd.Timestamp(ts)
+            if candle_ts not in hourly_cache:
+                hourly_cache[candle_ts] = set(
+                    select_universe_from_frames(
+                        frames,
+                        candle_ts,
+                        limit=universe_limit,
+                        lookback=universe_lookback,
+                        min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+                        noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+                        atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+                        beta_min=UNIVERSE_BETA_MIN,
+                        beta_top_n=UNIVERSE_BETA_TOP_N,
+                    )
                 )
-            )
+            active_universe = hourly_cache[candle_ts]
 
         equity = cash + sum(pos["qty"] * last_close.get(t, pos["entry_price"]) for t, pos in positions.items())
         equity_ts[ts] = equity
@@ -490,6 +547,40 @@ def simulate_portfolio(
     return trades, pd.Series(equity_ts, name="equity", dtype=float).sort_index()
 
 
+def build_hourly_universe_cache(
+    frames: dict[str, pd.DataFrame],
+    *,
+    start_at: pd.Timestamp | None = None,
+    universe_limit: int = UNIVERSE_TOP_N,
+    universe_lookback: int = UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    min_quote_volume_krw: float = UNIVERSE_MIN_DAILY_QUOTE_KRW,
+    noise_threshold: float = UNIVERSE_NOISE_THRESHOLD,
+    atr_exclude_ratio: float = UNIVERSE_ATR_EXCLUDE_RATIO,
+    beta_min: float = UNIVERSE_BETA_MIN,
+    beta_top_n: int = UNIVERSE_BETA_TOP_N,
+) -> tuple[dict[pd.Timestamp, set[str]], set[str]]:
+    timestamps = sorted({idx for df in frames.values() for idx in df.index if start_at is None or idx >= start_at})
+    hourly_cache: dict[pd.Timestamp, set[str]] = {}
+    union_tickers: set[str] = {"KRW-BTC"}
+    for ts in timestamps:
+        selected = set(
+            select_universe_from_frames(
+                frames,
+                pd.Timestamp(ts),
+                limit=universe_limit,
+                lookback=universe_lookback,
+                min_quote_volume_krw=min_quote_volume_krw,
+                noise_threshold=noise_threshold,
+                atr_exclude_ratio=atr_exclude_ratio,
+                beta_min=beta_min,
+                beta_top_n=beta_top_n,
+            )
+        )
+        hourly_cache[pd.Timestamp(ts)] = selected
+        union_tickers.update(selected)
+    return hourly_cache, union_tickers
+
+
 def select_universe_from_frames(
     frames: dict[str, pd.DataFrame],
     ts: pd.Timestamp,
@@ -502,6 +593,22 @@ def select_universe_from_frames(
     beta_min: float = 0.0,
     beta_top_n: int | None = None,
 ) -> list[str]:
+    if all(
+        required in df.columns
+        for df in frames.values()
+        for required in ("quote_volume_24h", "surge_24h", "rsi_momentum_4", "noise_24h", "atr_pct_24h", "ret_24h")
+    ):
+        return _select_universe_from_precomputed_rows(
+            frames,
+            ts,
+            limit=limit,
+            min_quote_volume_krw=min_quote_volume_krw,
+            noise_threshold=noise_threshold,
+            atr_exclude_ratio=atr_exclude_ratio,
+            beta_min=beta_min,
+            beta_top_n=beta_top_n,
+        )
+
     ranked: list[tuple[str, float]] = []
     for ticker, df in frames.items():
         if ticker in EXCLUDED_TICKERS:
@@ -536,6 +643,65 @@ def select_universe_from_frames(
     if beta_top:
         return beta_top[:limit]
     return atr_filtered[:limit]
+
+
+def _select_universe_from_precomputed_rows(
+    frames: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    *,
+    limit: int,
+    min_quote_volume_krw: float,
+    noise_threshold: float | None,
+    atr_exclude_ratio: float,
+    beta_min: float,
+    beta_top_n: int | None,
+) -> list[str]:
+    top_volume_ranked: list[tuple[str, float]] = []
+    surge_ranked: list[tuple[str, float]] = []
+    rsi_ranked: list[tuple[str, float]] = []
+    noise_map: dict[str, float] = {}
+    atr_pct_map: dict[str, float] = {}
+    ret_map: dict[str, float] = {}
+
+    btc_ret = 0.0
+    btc_row = _row_at_or_before(frames.get("KRW-BTC"), ts)
+    if btc_row is not None and pd.notna(btc_row.get("ret_24h")):
+        btc_ret = float(btc_row["ret_24h"])
+
+    for ticker, df in frames.items():
+        if ticker in EXCLUDED_TICKERS:
+            continue
+        row = _row_at_or_before(df, ts)
+        if row is None:
+            continue
+        quote_volume = row.get("quote_volume_24h")
+        if pd.notna(quote_volume) and float(quote_volume) >= min_quote_volume_krw:
+            top_volume_ranked.append((ticker, float(quote_volume)))
+        if pd.notna(row.get("surge_24h")):
+            surge_ranked.append((ticker, float(row["surge_24h"])))
+        if pd.notna(row.get("rsi_momentum_4")):
+            rsi_ranked.append((ticker, float(row["rsi_momentum_4"])))
+        if pd.notna(row.get("noise_24h")):
+            noise_map[ticker] = float(row["noise_24h"])
+        if pd.notna(row.get("atr_pct_24h")):
+            atr_pct_map[ticker] = float(row["atr_pct_24h"])
+        if pd.notna(row.get("ret_24h")):
+            ret = float(row["ret_24h"])
+            ret_map[ticker] = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
+
+    top_volume_ranked.sort(key=lambda item: item[1], reverse=True)
+    surge_ranked.sort(key=lambda item: item[1], reverse=True)
+    rsi_ranked.sort(key=lambda item: item[1], reverse=True)
+
+    mixed = blend_universe_candidates(top_volume_ranked[:30], surge_ranked, rsi_ranked, limit=30, rsi_bonus_count=5)
+    if noise_threshold is not None:
+        mixed = filter_by_noise_threshold(mixed, noise_map, threshold=noise_threshold)
+    if atr_exclude_ratio > 0:
+        mixed = exclude_high_atr_candidates(mixed, atr_pct_map, exclude_ratio=atr_exclude_ratio)
+    beta_top = prioritize_by_beta(mixed, ret_map, min_beta=beta_min, topn=beta_top_n or limit)
+    if beta_top:
+        return beta_top[:limit]
+    return mixed[:limit]
 
 
 def select_daily_universe_from_frames(
@@ -604,12 +770,16 @@ def count_daily_universe_membership(
 
 def _market_row(frames: dict[str, pd.DataFrame], ts: pd.Timestamp) -> pd.Series | None:
     btc = frames.get("KRW-BTC")
-    if btc is None:
+    return _row_at_or_before(btc, ts)
+
+
+def _row_at_or_before(df: pd.DataFrame | None, ts: pd.Timestamp) -> pd.Series | None:
+    if df is None or df.empty:
         return None
-    window = btc.loc[btc.index <= ts]
-    if window.empty:
+    pos = df.index.searchsorted(ts, side="right") - 1
+    if pos < 0:
         return None
-    return window.iloc[-1]
+    return df.iloc[pos]
 
 
 def _volume_surge_from_frames(
@@ -937,7 +1107,7 @@ def main() -> None:
     parser.add_argument(
         "--universe-mode",
         choices=["hourly", "daily"],
-        default="hourly",
+        default="daily",
         help="Dynamic universe ranking cadence. daily uses previous completed day quote-volume TOP N.",
     )
     parser.add_argument("--refresh-cache", action="store_true", help="Refresh OHLCV cache from Upbit before running.")
@@ -952,6 +1122,7 @@ def main() -> None:
         help="Use the legacy 5 fixed tickers instead of dynamic KRW-market discovery.",
     )
     args = parser.parse_args()
+    activate_final_tuned_profile()
 
     frames: dict[str, pd.DataFrame] = {}
     configs: dict[str, StrategyConfig] = {}
@@ -965,12 +1136,11 @@ def main() -> None:
         tickers = get_krw_tickers()
 
     for ticker in tickers:
-        raw = fetch_year_of_data(ticker, refresh_cache=args.refresh_cache)
-        if raw.empty or len(raw) < 1_000:
+        df = load_indicator_frame(ticker, refresh_cache=args.refresh_cache)
+        if df.empty or len(df) < 1_000:
             print(f"[{ticker}] insufficient data - skipped")
             skipped.append(ticker)
             continue
-        df = add_indicators(raw)
         if args.sample:
             df = df.tail(args.sample)
         frames[ticker] = df

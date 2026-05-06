@@ -13,8 +13,8 @@ def test_strategy_summary_describes_active_strategy():
     summary = bot.strategy_summary()
 
     assert "KRW-USDT 제외 거래대금 상위 10개" in summary
-    assert "TOP30+거래량증가 혼합/BTC 필터/듀얼 엔트리" in summary
-    assert "ATR 1% 리스크" in summary
+    assert "TOP30+거래량증가 혼합/BTC 필터/PRIMARY 중심 엔트리" in summary
+    assert "완화형 VWAP/ATR 추세보유" in summary
     assert "최대 1개" in summary
 
 

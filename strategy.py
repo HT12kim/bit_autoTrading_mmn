@@ -32,6 +32,7 @@ SECONDARY_RSI_LEVEL = 45
 ENTRY_RSI_MAX = 72
 ENTRY_MA20_DISPARITY_MAX = 0.05
 VOLUME_PULLBACK_MULTIPLIER = 0.7
+PRIMARY_VOLUME_SPIKE_MULTIPLIER = 2.0
 MARKET_RSI_MIN = 45
 STOP_LOSS = 0.04
 ATR_STOP_MULTIPLIER = 1.8
@@ -40,6 +41,10 @@ BREAKEVEN_PLUS_ARM_PNL = 0.03
 TRAILING_TAKE_PROFIT_DRAWDOWN = 0.04
 TRAILING_STEP_UP_PNL = 0.07
 TRAILING_STEP_UP_DRAWDOWN = 0.03
+VWAP_EXIT_BUFFER = 1.0
+VWAP_EXIT_LOCKED_PROFIT_BUFFER = 1.01
+DEAD_CROSS_EXIT_ENABLED = True
+BB_REV_PARTIAL_EXIT_ENABLED = True
 TIME_CUT_BARS = 24
 TIME_CUT_MIN_PNL = 0.002
 FAST_TIME_CUT_BARS = 6
@@ -67,12 +72,58 @@ class StrategyConfig:
 
 DEFAULT_CONFIG = StrategyConfig()
 TICKER_CONFIGS: dict[str, StrategyConfig] = {}
+FINAL_TUNED_PROFILE: dict[str, Any] = {
+    "SECONDARY_RSI_LEVEL": 100,
+    "PRIMARY_VOLUME_SPIKE_MULTIPLIER": 0.9,
+    "ENTRY_RSI_MAX": 80,
+    "VOLUME_PULLBACK_MULTIPLIER": 0.6,
+    "MARKET_RSI_MIN": 30,
+    "ATR_STOP_MULTIPLIER": 4.5,
+    "TAKE_PROFIT_ARM_PNL": 0.08,
+    "TRAILING_TAKE_PROFIT_DRAWDOWN": 0.12,
+    "TRAILING_STEP_UP_PNL": 0.15,
+    "TRAILING_STEP_UP_DRAWDOWN": 0.11,
+    "VWAP_EXIT_BUFFER": 0.97,
+    "VWAP_EXIT_LOCKED_PROFIT_BUFFER": 0.98,
+    "TIME_CUT_BARS": 96,
+    "TIME_CUT_MIN_PNL": -0.05,
+    "FAST_TIME_CUT_BARS": 36,
+    "FAST_TIME_CUT_MIN_PNL": -0.12,
+    "DEAD_CROSS_EXIT_ENABLED": True,
+    "BB_REV_PARTIAL_EXIT_ENABLED": True,
+}
 
 
 def get_strategy_config(ticker: str | None = None) -> StrategyConfig:
     if ticker and ticker in TICKER_CONFIGS:
         return TICKER_CONFIGS[ticker]
     return replace(DEFAULT_CONFIG, ticker=ticker)
+
+
+def apply_parameter_overrides(overrides: dict[str, Any]) -> None:
+    """Apply tunable strategy parameters and rebuild the default config."""
+    global DEFAULT_CONFIG
+
+    for key, value in overrides.items():
+        globals()[key] = value
+
+    DEFAULT_CONFIG = StrategyConfig(
+        volume_multiplier=VOLUME_PULLBACK_MULTIPLIER,
+        stop_loss=STOP_LOSS,
+        atr_stop_multiplier=ATR_STOP_MULTIPLIER,
+        take_profit_arm_pnl=TAKE_PROFIT_ARM_PNL,
+        trailing_take_profit_drawdown=TRAILING_TAKE_PROFIT_DRAWDOWN,
+        trailing_step_up_pnl=TRAILING_STEP_UP_PNL,
+        trailing_step_up_drawdown=TRAILING_STEP_UP_DRAWDOWN,
+        time_cut_bars=TIME_CUT_BARS,
+        time_cut_min_pnl=TIME_CUT_MIN_PNL,
+        cooldown_minutes=30,
+    )
+
+
+def activate_final_tuned_profile() -> None:
+    """Activate the best-performing 1-year tuned profile."""
+    apply_parameter_overrides(FINAL_TUNED_PROFILE)
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,7 +227,7 @@ def entry_signal(
         and current["rsi"] > PULLBACK_RSI_LEVEL
     )
     bb_touch_ok = bool(current["low"] <= current["bb_lower"] and current["close"] > current["bb_lower"])
-    volume_spike_primary = bool(current["volume"] > current["vol_ma20"] * 2.0)
+    volume_spike_primary = bool(current["volume"] > current["vol_ma20"] * PRIMARY_VOLUME_SPIKE_MULTIPLIER)
     primary_entry_ok = rsi30_rebound_ok and bb_touch_ok and volume_spike_primary
     rsi45_rebound_ok = bool(previous["rsi"] <= SECONDARY_RSI_LEVEL and current["rsi"] > SECONDARY_RSI_LEVEL)
     ma60_uptrend_ok = bool(current["ma60_slope"] > 0)
@@ -302,12 +353,14 @@ def exit_signal(
 
     # v10.0: +5% 이후에는 VWAP 기준을 1% 상향해 수익 보존을 강화한다.
     if _finite(current, "vwap"):
-        vwap_floor = float(current["vwap"]) * (1.01 if pnl >= 0.05 else 1.0)
+        vwap_floor = float(current["vwap"]) * (
+            VWAP_EXIT_LOCKED_PROFIT_BUFFER if pnl >= 0.05 else VWAP_EXIT_BUFFER
+        )
         if close < vwap_floor:
             return live_price, "VWAP_BREAKDOWN", armed, highest, overbought_seen, bb_break_seen
 
     # MA5/MA20 데드크로스는 추세 훼손 신호이므로 손절/익절보다 먼저 즉시 청산한다.
-    if _dead_cross_ma5_ma20(current, previous):
+    if DEAD_CROSS_EXIT_ENABLED and _dead_cross_ma5_ma20(current, previous):
         return live_price, "MA5_MA20_DEAD_CROSS", armed, highest, overbought_seen, bb_break_seen
 
     held_bars = bars_held if bars_held is not None else _held_bars(entry_time, current_time or _series_time(current))
@@ -319,7 +372,7 @@ def exit_signal(
     if not partial_taken and pnl >= cfg.take_profit_arm_pnl:
         return live_price, "PARTIAL_TAKE_PROFIT_50", True, highest, overbought_seen, bb_break_seen
 
-    if partial_taken and _finite(current, "bb_upper"):
+    if BB_REV_PARTIAL_EXIT_ENABLED and partial_taken and _finite(current, "bb_upper"):
         if not bb_break_seen and close > float(current["bb_upper"]):
             bb_break_seen = True
         elif bb_break_seen and close < float(current["bb_upper"]):

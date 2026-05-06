@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from strategy import (
     ROUND_TRIP_FEE,
+    activate_final_tuned_profile,
     add_indicators,
     adaptive_stop_price,
     cooldown_until_after_loss,
@@ -425,8 +426,8 @@ def build_startup_strategy_message(
 def strategy_summary() -> str:
     return (
         f"KRW-USDT 제외 거래대금 상위 {UNIVERSE_TOP_N}개, "
-        "TOP30+거래량증가 혼합/BTC 필터/듀얼 엔트리, "
-        f"ATR 1% 리스크/예수금 {PER_TRADE_RATIO*100:.0f}% 상한, 최대 {MAX_CONCURRENT}개"
+        "TOP30+거래량증가 혼합/BTC 필터/PRIMARY 중심 엔트리, "
+        f"완화형 VWAP/ATR 추세보유/예수금 {PER_TRADE_RATIO*100:.0f}% 상한, 최대 {MAX_CONCURRENT}개"
     )
 
 
@@ -698,6 +699,7 @@ def seconds_to_next_hour() -> float:
 # ── 메인 루프 ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    activate_final_tuned_profile()
     upbit = get_upbit()
     state: dict | None = ensure_state_schema(load_state())
     initial_equity = get_total_equity(upbit)
