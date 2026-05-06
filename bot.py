@@ -37,8 +37,12 @@ from universe import (
     UNIVERSE_MIN_DAILY_QUOTE_KRW,
     UNIVERSE_NOISE_THRESHOLD,
     UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    blend_universe_candidates,
+    exclude_high_atr_candidates,
+    filter_by_noise_threshold,
     get_krw_tickers,
     price_noise_pct,
+    prioritize_by_beta,
     rank_by_quote_volume,
 )
 
@@ -257,12 +261,6 @@ def select_liquid_universe() -> list[str]:
         surge.append((ticker, (curr_day - prev_day) / prev_day))
     surge.sort(key=lambda item: item[1], reverse=True)
 
-    mix_score: dict[str, float] = {}
-    for idx, (ticker, _) in enumerate(top_volume):
-        mix_score[ticker] = mix_score.get(ticker, 0.0) + (len(top_volume) - idx)
-    for idx, (ticker, _) in enumerate(surge):
-        mix_score[ticker] = mix_score.get(ticker, 0.0) + (len(surge) - idx)
-
     # v8.0: RSI 상승 기울기가 가파른 상위 5종목에 가중치를 부여한다.
     rsi_momentum: list[tuple[str, float]] = []
     for ticker, _ in top_volume:
@@ -275,23 +273,19 @@ def select_liquid_universe() -> list[str]:
             continue
         rsi_momentum.append((ticker, float(rsi.iloc[-1] - rsi.iloc[-4])))
     rsi_momentum.sort(key=lambda item: item[1], reverse=True)
-    for idx, (ticker, _) in enumerate(rsi_momentum[:5]):
-        mix_score[ticker] = mix_score.get(ticker, 0.0) + (5 - idx)
-    mixed = [ticker for ticker, _ in sorted(mix_score.items(), key=lambda item: item[1], reverse=True)[:30]]
+    mixed = blend_universe_candidates(top_volume, surge, rsi_momentum, limit=30, rsi_bonus_count=5)
 
     # v10.0: Noise Ratio < 0.55 인 종목만 유니버스로 유지
-    noise_filtered: list[str] = []
+    noise_map: dict[str, float] = {}
     for ticker in mixed:
         df = pyupbit.get_ohlcv(ticker, interval="minute60", count=24)
         if df is None or df.empty:
             continue
-        if price_noise_pct(df) < UNIVERSE_NOISE_THRESHOLD:
-            noise_filtered.append(ticker)
-    if noise_filtered:
-        mixed = noise_filtered
+        noise_map[ticker] = price_noise_pct(df)
+    mixed = filter_by_noise_threshold(mixed, noise_map, threshold=UNIVERSE_NOISE_THRESHOLD)
 
     # B안: 혼합 후보군에서 ATR% 상위 10%를 제외해 급변동 리스크를 완화한다.
-    atr_rank: list[tuple[str, float]] = []
+    atr_pct_map: dict[str, float] = {}
     for ticker in mixed:
         df = pyupbit.get_ohlcv(ticker, interval="minute60", count=48)
         if df is None or len(df) < 24:
@@ -299,31 +293,30 @@ def select_liquid_universe() -> list[str]:
         enriched = add_indicators(df)
         atr_pct = float(enriched["atr_pct"].tail(24).mean())
         if atr_pct > 0:
-            atr_rank.append((ticker, atr_pct))
-    if atr_rank:
-        remove_count = max(1, int(len(atr_rank) * UNIVERSE_ATR_EXCLUDE_RATIO))
-        high_atr = {ticker for ticker, _ in sorted(atr_rank, key=lambda item: item[1], reverse=True)[:remove_count]}
-        filtered = [ticker for ticker in mixed if ticker not in high_atr]
-        if filtered:
-            mixed = filtered
+            atr_pct_map[ticker] = atr_pct
+    mixed = exclude_high_atr_candidates(mixed, atr_pct_map, exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO)
 
     # v10.0: BTC 대비 24시간 수익률 배수(Beta) 상위 종목 우선
     btc_df = pyupbit.get_ohlcv("KRW-BTC", interval="minute60", count=25)
     btc_ret = 0.0
     if btc_df is not None and len(btc_df) >= 25:
         btc_ret = float(btc_df["close"].iloc[-1] / btc_df["close"].iloc[0] - 1)
-    beta_rank: list[tuple[str, float]] = []
+    beta_map: dict[str, float] = {}
     for ticker in mixed:
         df = pyupbit.get_ohlcv(ticker, interval="minute60", count=25)
         if df is None or len(df) < 25:
             continue
         ret = float(df["close"].iloc[-1] / df["close"].iloc[0] - 1)
         beta = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
-        beta_rank.append((ticker, beta))
-    beta_rank.sort(key=lambda item: item[1], reverse=True)
-    selected = [ticker for ticker, beta in beta_rank if beta >= UNIVERSE_BETA_MIN][:UNIVERSE_BETA_TOP_N]
+        beta_map[ticker] = beta
+    selected = prioritize_by_beta(
+        mixed,
+        beta_map,
+        min_beta=UNIVERSE_BETA_MIN,
+        topn=UNIVERSE_BETA_TOP_N,
+    )
     if not selected:
-        selected = [ticker for ticker, _ in beta_rank[:UNIVERSE_BETA_TOP_N]]
+        selected = mixed[:UNIVERSE_BETA_TOP_N]
     if selected:
         return selected
     return mixed[:UNIVERSE_TOP_N]
@@ -361,10 +354,10 @@ def send_telegram_message(message: str) -> bool:
 
 def telegram_due(state: dict, now: datetime | None = None) -> bool:
     now = now or datetime.now()
-    if now.minute not in (0, 30):
+    if now.minute != 0:
         return False
 
-    # 루프가 정각/30분 캔들 이후 여러 번 실행되어도 같은 슬롯에는 1회만 전송한다.
+    # 루프가 정각 이후 여러 번 실행되어도 같은 슬롯에는 1회만 전송한다.
     current_slot = now.strftime("%Y-%m-%d %H:%M")
     return state.get("last_telegram_slot") != current_slot
 
@@ -380,14 +373,16 @@ def build_status_message(
     daily_pnl_krw = float(state.get("daily_pnl_krw", 0.0) or 0.0)
     daily_pnl_rate = daily_pnl_krw / starting_equity if starting_equity > 0 else 0.0
     universe = ", ".join(state.get("active_universe") or []) or "없음"
+    universe_updated_at = state.get("universe_updated_at") or "-"
 
     lines = [
-        "<b>btc_inv 30분 현황</b>",
+        "<b>btc_inv 정각 현황</b>",
         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"자산: {equity:,.0f} KRW",
         f"일일PnL: {daily_pnl_krw:+,.0f} KRW ({daily_pnl_rate*100:+.2f}%)",
         f"상태: {risk_reason}",
-        f"후보: {universe}",
+        f"유니버스 TOP: {universe}",
+        f"유니버스 갱신: {universe_updated_at}",
         f"보유: {len(state.get('positions', {}))}개",
     ]
 
@@ -403,20 +398,24 @@ def build_status_message(
     return "\n".join(lines)
 
 
-def build_startup_strategy_message() -> str:
-    """봇 프로세스 시작 시 현재 적용 중인 전략을 1회 안내한다."""
+def build_startup_strategy_message(
+    state: dict | None = None,
+    equity: float | None = None,
+) -> str:
+    """봇 프로세스 시작 시 현재 전략과 초기 계좌 상태를 1회 안내한다."""
+    positions = (state or {}).get("positions", {}) if isinstance(state, dict) else {}
+    universe = ", ".join((state or {}).get("active_universe", []) or []) or "없음"
+    equity_line = f"시작 자산: {equity:,.0f} KRW" if equity is not None and equity > 0 else "시작 자산: 조회 전"
     return "\n".join(
         [
             "<b>btc_inv 봇 시작</b>",
             f"시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            equity_line,
+            f"보유 state 포지션: {len(positions)}개",
+            f"초기 유니버스 TOP: {universe}",
             f"적용 전략: {strategy_summary()}",
-            f"유니버스: KRW-USDT 제외 거래대금 TOP {UNIVERSE_TOP_N} + 전일대비 거래량 증가 혼합 (24h 500억 이상)",
-            "지표: 1시간봉 MA20/5/60/120일, BB20/2, RSI14, ATR14",
-            "진입: BTC MA20 상회 또는 RSI40 초과 + (BB/RSI30 또는 MA20/RSI45) + 직전 1봉 고가 돌파, RSI65 이하",
-            "포지션 크기: 종목당 예수금 12.5% 고정, 최대 8개 분산",
+            "정기 알림: 매시 정각 유니버스/보유종목/자산 현황 전송",
             "주문: 현재가 기준 지정가 우선, 10초 미체결분 취소",
-            "청산: +3% 50% 부분익절, 이후 RSI 70 상향후 하향 시 잔량 전량 / 고점대비 -3% 트레일링 / 24봉 손익 +1% 미만 Time-Stop / entry-2*ATR",
-            f"동시 보유 한도: 최대 {MAX_CONCURRENT}개",
             f"리스크 제한: 일일 손실 {DAILY_LOSS_LIMIT*100:.0f}% 도달 시 중지 / "
             f"{CONSECUTIVE_LOSS_HALT}연속 손실 시 {HALT_DURATION_MIN}분 휴식",
         ]
@@ -532,10 +531,13 @@ def send_shutdown_notice(state: dict | None = None) -> None:
         log.info("텔레그램 종료 알림 전송 완료")
 
 
-def send_startup_strategy_notice() -> None:
+def send_startup_strategy_notice(
+    state: dict | None = None,
+    equity: float | None = None,
+) -> None:
     if not telegram_enabled():
         return
-    if send_telegram_message(build_startup_strategy_message()):
+    if send_telegram_message(build_startup_strategy_message(state, equity)):
         log.info("텔레그램 시작 전략 안내 전송 완료")
 
 
@@ -697,14 +699,20 @@ def seconds_to_next_hour() -> float:
 
 def main() -> None:
     upbit = get_upbit()
-    state: dict | None = None
+    state: dict | None = ensure_state_schema(load_state())
+    initial_equity = get_total_equity(upbit)
+    if state.get("starting_equity", 0) == 0 and initial_equity > 0:
+        state["starting_equity"] = initial_equity
+    reset_if_new_day(state, initial_equity)
+    state["active_universe"] = refresh_active_universe(state)
+    save_state(state)
     log.info(
         "봇 시작 — KRW 마켓 최근 %d분 거래대금 상위 %d | %s | 매 루프 갱신",
         UNIVERSE_VOLUME_LOOKBACK_MINUTES,
         UNIVERSE_TOP_N,
         INTERVAL,
     )
-    send_startup_strategy_notice()
+    send_startup_strategy_notice(state, initial_equity)
 
     try:
         while True:

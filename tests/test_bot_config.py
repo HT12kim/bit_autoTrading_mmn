@@ -6,40 +6,38 @@ import bot
 
 
 def test_per_trade_ratio_uses_twenty_percent_krw_balance():
-    assert bot.PER_TRADE_RATIO == 0.20
+    assert bot.PER_TRADE_RATIO == 1.00
 
 
 def test_strategy_summary_describes_active_strategy():
     summary = bot.strategy_summary()
 
     assert "KRW-USDT 제외 거래대금 상위 10개" in summary
-    assert "저변동 제외+BB 하단 재진입+RSI30 재돌파+RSI60/이격도 필터" in summary
+    assert "TOP30+거래량증가 혼합/BTC 필터/듀얼 엔트리" in summary
     assert "ATR 1% 리스크" in summary
-    assert "최대 3개" in summary
+    assert "최대 1개" in summary
 
 
 def test_startup_strategy_message_describes_current_strategy(monkeypatch):
     monkeypatch.setattr(bot, "datetime", _FixedDateTime)
 
-    message = bot.build_startup_strategy_message()
+    message = bot.build_startup_strategy_message(
+        {
+            "positions": {"KRW-BTC": {}},
+            "active_universe": ["KRW-BTC", "KRW-ETH"],
+        },
+        equity=1_234_567,
+    )
 
     assert "<b>btc_inv 봇 시작</b>" in message
+    assert "시간: 2026-01-01 09:30:05" in message
+    assert "시작 자산: 1,234,567 KRW" in message
+    assert "보유 state 포지션: 1개" in message
+    assert "초기 유니버스 TOP: KRW-BTC, KRW-ETH" in message
     assert "적용 전략: KRW-USDT 제외 거래대금 상위 10개" in message
-    assert "KRW-USDT 제외" in message
-    assert "거래대금 상위 10개 중 ATR% 하위 30% 제외" in message
-    assert "MA20/5/60/120일" in message
-    assert "BB20/2" in message
-    assert "RSI14" in message
-    assert "ATR14" in message
-    assert "BTC MA20 상회 또는 RSI40 초과" in message
-    assert "RSI60 이하" in message
-    assert "MA20 대비 +5% 이내" in message
-    assert "ATR 손절 기준 1% 리스크" in message
+    assert "정기 알림: 매시 정각 유니버스/보유종목/자산 현황 전송" in message
     assert "현재가 기준 지정가 우선, 10초 미체결분 취소" in message
-    assert "MA5/MA20 데드크로스 즉시 시장가" in message
-    assert "48봉 Time-Cut" in message
-    assert "+5%부터 -1.0%" in message
-    assert "동시 보유 한도: 최대 3개" in message
+    assert "5연속 손실 시 60분 휴식" in message
 
 
 def test_send_startup_strategy_notice_uses_telegram_when_enabled(monkeypatch):
@@ -49,10 +47,11 @@ def test_send_startup_strategy_notice_uses_telegram_when_enabled(monkeypatch):
     monkeypatch.setattr(bot, "send_telegram_message", lambda message: messages.append(message) or True)
     monkeypatch.setattr(bot, "datetime", _FixedDateTime)
 
-    bot.send_startup_strategy_notice()
+    bot.send_startup_strategy_notice({"positions": {}, "active_universe": ["KRW-BTC"]}, 1_000_000)
 
     assert len(messages) == 1
     assert "btc_inv 봇 시작" in messages[0]
+    assert "초기 유니버스 TOP: KRW-BTC" in messages[0]
     assert "적용 전략:" in messages[0]
 
 
@@ -67,15 +66,15 @@ def test_send_startup_strategy_notice_skips_when_telegram_disabled(monkeypatch):
     assert messages == []
 
 
-def test_telegram_due_only_at_hour_and_half_hour():
+def test_telegram_due_only_at_hour():
     state = {"last_telegram_slot": None}
 
     assert bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 0, 5))
-    assert bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 30, 5))
+    assert not bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 30, 5))
     assert not bot.telegram_due(state, now=datetime(2026, 1, 1, 9, 1, 5))
     assert not bot.telegram_due(
-        {"last_telegram_slot": "2026-01-01 09:30"},
-        now=datetime(2026, 1, 1, 9, 30, 10),
+        {"last_telegram_slot": "2026-01-01 09:00"},
+        now=datetime(2026, 1, 1, 9, 0, 10),
     )
 
 
@@ -91,24 +90,26 @@ def test_regular_status_notification_uses_requested_format(monkeypatch):
         "starting_equity": 1_000_000,
         "daily_pnl_krw": 12_345,
         "active_universe": ["KRW-BTC", "KRW-ETH"],
+        "universe_updated_at": "2026-01-01T08:59:59",
         "positions": {},
         "last_telegram_slot": None,
     }
 
     monkeypatch.setattr(bot, "telegram_enabled", lambda: True)
     monkeypatch.setattr(bot, "send_telegram_message", lambda message: messages.append(message) or True)
-    monkeypatch.setattr(bot, "datetime", _FixedDateTime)
+    monkeypatch.setattr(bot, "datetime", _FixedHourDateTime)
 
     bot.maybe_send_hourly_status(object(), state, 1_012_345)
 
     assert len(messages) == 1
-    assert "<b>btc_inv 30분 현황</b>" in messages[0]
+    assert "<b>btc_inv 정각 현황</b>" in messages[0]
     assert "자산: 1,012,345 KRW" in messages[0]
     assert "일일PnL: +12,345 KRW (+1.23%)" in messages[0]
     assert "상태: OK" in messages[0]
-    assert "후보: KRW-BTC, KRW-ETH" in messages[0]
+    assert "유니버스 TOP: KRW-BTC, KRW-ETH" in messages[0]
+    assert "유니버스 갱신: 2026-01-01T08:59:59" in messages[0]
     assert "보유: 0개" in messages[0]
-    assert state["last_telegram_slot"] == "2026-01-01 09:30"
+    assert state["last_telegram_slot"] == "2026-01-01 09:00"
 
 
 def test_status_message_includes_position_state(monkeypatch):
@@ -131,6 +132,7 @@ def test_status_message_includes_position_state(monkeypatch):
     message = bot.build_status_message(object(), state, 1_000_000, risk_reason="OK")
 
     assert "KRW-BTC: +7.80%" in message
+    assert "유니버스 TOP: KRW-BTC, KRW-XRP, KRW-ETH" in message
     assert "진입 100" in message
     assert "현재 108" in message
 
@@ -220,6 +222,12 @@ class _FixedDateTime(datetime):
     @classmethod
     def now(cls):
         return cls(2026, 1, 1, 9, 30, 5)
+
+
+class _FixedHourDateTime(datetime):
+    @classmethod
+    def now(cls):
+        return cls(2026, 1, 1, 9, 0, 5)
 
 
 class _FakeUpbit:

@@ -146,6 +146,70 @@ def select_top_volume_tickers(
     return [ticker for ticker, _ in filtered[:limit]]
 
 
+def blend_universe_candidates(
+    top_volume_ranked: list[tuple[str, float]],
+    surge_ranked: list[tuple[str, float]] | None = None,
+    rsi_momentum_ranked: list[tuple[str, float]] | None = None,
+    *,
+    limit: int = 30,
+    rsi_bonus_count: int = 5,
+) -> list[str]:
+    """거래대금/거래량 증가/RSI 모멘텀을 합산해 혼합 후보군을 만든다."""
+    mix_score: dict[str, float] = {}
+    for idx, (ticker, _) in enumerate(top_volume_ranked):
+        mix_score[ticker] = mix_score.get(ticker, 0.0) + (len(top_volume_ranked) - idx)
+    for ranked in (surge_ranked or [],):
+        for idx, (ticker, _) in enumerate(ranked):
+            mix_score[ticker] = mix_score.get(ticker, 0.0) + (len(ranked) - idx)
+    for idx, (ticker, _) in enumerate((rsi_momentum_ranked or [])[:rsi_bonus_count]):
+        mix_score[ticker] = mix_score.get(ticker, 0.0) + (rsi_bonus_count - idx)
+    return [ticker for ticker, _ in sorted(mix_score.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+def filter_by_noise_threshold(
+    candidates: list[str],
+    noise_map: dict[str, float],
+    *,
+    threshold: float,
+) -> list[str]:
+    kept = [ticker for ticker in candidates if noise_map.get(ticker, threshold + 1) < threshold]
+    return kept or candidates
+
+
+def exclude_high_atr_candidates(
+    candidates: list[str],
+    atr_pct_map: dict[str, float],
+    *,
+    exclude_ratio: float,
+) -> list[str]:
+    if exclude_ratio <= 0:
+        return candidates
+    scored = [
+        (ticker, atr_pct_map[ticker])
+        for ticker in candidates
+        if ticker in atr_pct_map and pd.notna(atr_pct_map[ticker]) and atr_pct_map[ticker] > 0
+    ]
+    if not scored:
+        return candidates
+    remove_count = max(1, int(len(scored) * exclude_ratio))
+    high_atr = {ticker for ticker, _ in sorted(scored, key=lambda item: item[1], reverse=True)[:remove_count]}
+    filtered = [ticker for ticker in candidates if ticker not in high_atr]
+    return filtered or candidates
+
+
+def prioritize_by_beta(
+    candidates: list[str],
+    beta_map: dict[str, float],
+    *,
+    min_beta: float,
+    topn: int,
+) -> list[str]:
+    scored = [(ticker, beta_map[ticker]) for ticker in candidates if ticker in beta_map and pd.notna(beta_map[ticker])]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected = [ticker for ticker, beta in scored if beta >= min_beta][:topn]
+    return selected or [ticker for ticker, _ in scored[:topn]]
+
+
 def universe_refresh_due(
     updated_at: str | None,
     *,

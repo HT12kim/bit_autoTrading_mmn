@@ -5,10 +5,14 @@ from datetime import datetime
 import pandas as pd
 
 from universe import (
+    blend_universe_candidates,
     closed_candle_window,
+    exclude_high_atr_candidates,
     filter_low_volatility_tickers,
+    filter_by_noise_threshold,
     get_krw_tickers,
     price_noise_pct,
+    prioritize_by_beta,
     quote_volume_krw,
     rank_by_quote_volume,
     select_top_volume_tickers,
@@ -44,6 +48,52 @@ def test_filter_low_volatility_tickers_preserves_volume_order():
     selected = filter_low_volatility_tickers(ranked, exclude_ratio=0.25)
 
     assert selected == ["KRW-XRP", "KRW-ETH", "KRW-SOL"]
+
+
+def test_blend_universe_candidates_applies_volume_surge_and_rsi_bonus():
+    top_volume = [("KRW-BTC", 1000.0), ("KRW-ETH", 900.0), ("KRW-XRP", 800.0)]
+    surge = [("KRW-XRP", 0.5), ("KRW-ETH", 0.3)]
+    rsi_momentum = [("KRW-XRP", 10.0), ("KRW-ETH", 5.0)]
+
+    selected = blend_universe_candidates(top_volume, surge, rsi_momentum, limit=3, rsi_bonus_count=2)
+
+    assert selected == ["KRW-XRP", "KRW-ETH", "KRW-BTC"]
+
+
+def test_filter_by_noise_threshold_falls_back_when_all_filtered():
+    selected = filter_by_noise_threshold(["KRW-BTC", "KRW-ETH"], {"KRW-BTC": 0.7, "KRW-ETH": 0.8}, threshold=0.55)
+
+    assert selected == ["KRW-BTC", "KRW-ETH"]
+
+
+def test_exclude_high_atr_candidates_removes_upper_tail():
+    selected = exclude_high_atr_candidates(
+        ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL"],
+        {"KRW-BTC": 0.01, "KRW-ETH": 0.02, "KRW-XRP": 0.05, "KRW-SOL": 0.03},
+        exclude_ratio=0.25,
+    )
+
+    assert selected == ["KRW-BTC", "KRW-ETH", "KRW-SOL"]
+
+
+def test_prioritize_by_beta_uses_threshold_then_rank_fallback():
+    selected = prioritize_by_beta(
+        ["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+        {"KRW-BTC": 0.9, "KRW-ETH": 1.3, "KRW-XRP": 1.1},
+        min_beta=1.2,
+        topn=2,
+    )
+
+    assert selected == ["KRW-ETH"]
+
+    fallback = prioritize_by_beta(
+        ["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+        {"KRW-BTC": 0.9, "KRW-ETH": 1.1, "KRW-XRP": 1.0},
+        min_beta=1.2,
+        topn=2,
+    )
+
+    assert fallback == ["KRW-ETH", "KRW-XRP"]
 
 
 def test_closed_candle_window_drops_newest_when_extra_row_exists():

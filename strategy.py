@@ -171,7 +171,6 @@ def entry_signal(
     if not all(_finite(current, col) for col in required) or not _finite(previous, "rsi"):
         return False, "HOLD [insufficient indicators]"
 
-    trend_ok = True
     rsi30_rebound_ok = bool(
         previous["rsi"] <= PULLBACK_RSI_LEVEL
         and current["rsi"] > PULLBACK_RSI_LEVEL
@@ -213,7 +212,7 @@ def entry_signal(
         vwap_breakout_spike and current["close"] < current["vwap"] * 1.02
     )
 
-    if trend_ok and pullback_ok and volume_ok and market_ok and overbought_ok and disparity_ok and breakout_ok and vwap_guard_ok and vwap_gap_ok and poc_ok:
+    if pullback_ok and volume_ok and market_ok and overbought_ok and disparity_ok and breakout_ok and vwap_guard_ok and vwap_gap_ok and poc_ok:
         entry_tag = "PRIMARY_SPIKE" if primary_entry_ok and volume_spike_primary else ("PRIMARY" if primary_entry_ok else "SECONDARY")
         return True, (
             f"[ENTRY:{entry_tag}] "
@@ -224,8 +223,7 @@ def entry_signal(
 
     return False, (
         "HOLD "
-        f"[TREND={'Y' if trend_ok else 'N'} "
-        f"PULLBACK={'Y' if pullback_ok else 'N'} "
+        f"[PULLBACK={'Y' if pullback_ok else 'N'} "
         f"VOL={'Y' if volume_ok else 'N'} "
         f"MARKET={'Y' if market_ok else 'N'} "
         f"RSI_COOL={'Y' if overbought_ok else 'N'} "
@@ -341,7 +339,10 @@ def exit_signal(
         armed = True
 
     if was_armed:
-        trailing_level = highest * (1 - cfg.trailing_take_profit_drawdown)
+        trailing_drawdown = cfg.trailing_take_profit_drawdown
+        if pnl >= cfg.trailing_step_up_pnl:
+            trailing_drawdown = cfg.trailing_step_up_drawdown
+        trailing_level = highest * (1 - trailing_drawdown)
         if _finite(current, "atr14"):
             trailing_level = max(trailing_level, highest - (2.5 * float(current["atr14"])))
         if live_price <= trailing_level or low <= trailing_level:

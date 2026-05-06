@@ -42,8 +42,12 @@ from universe import (
     UNIVERSE_MIN_DAILY_QUOTE_KRW,
     UNIVERSE_NOISE_THRESHOLD,
     UNIVERSE_VOLUME_LOOKBACK_MINUTES,
+    blend_universe_candidates,
+    exclude_high_atr_candidates,
+    filter_by_noise_threshold,
     get_krw_tickers,
     price_noise_pct,
+    prioritize_by_beta,
     quote_volume_krw,
 )
 
@@ -287,6 +291,11 @@ def simulate_portfolio(
                         frames,
                         day,
                         limit=universe_limit,
+                        min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+                        noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+                        atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+                        beta_min=UNIVERSE_BETA_MIN,
+                        beta_top_n=UNIVERSE_BETA_TOP_N,
                     )
                 )
             active_universe = daily_universe_cache[day]
@@ -297,6 +306,11 @@ def simulate_portfolio(
                     ts,
                     limit=universe_limit,
                     lookback=universe_lookback,
+                    min_quote_volume_krw=UNIVERSE_MIN_DAILY_QUOTE_KRW,
+                    noise_threshold=UNIVERSE_NOISE_THRESHOLD,
+                    atr_exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+                    beta_min=UNIVERSE_BETA_MIN,
+                    beta_top_n=UNIVERSE_BETA_TOP_N,
                 )
             )
 
@@ -482,6 +496,11 @@ def select_universe_from_frames(
     *,
     limit: int = UNIVERSE_TOP_N,
     lookback: int = UNIVERSE_DAILY_LOOKBACK_MINUTES,
+    min_quote_volume_krw: float = 0.0,
+    noise_threshold: float | None = None,
+    atr_exclude_ratio: float = 0.0,
+    beta_min: float = 0.0,
+    beta_top_n: int | None = None,
 ) -> list[str]:
     ranked: list[tuple[str, float]] = []
     for ticker, df in frames.items():
@@ -489,18 +508,31 @@ def select_universe_from_frames(
             continue
         window = df.loc[df.index <= ts].tail(lookback)
         volume = quote_volume_krw(window)
-        if volume >= UNIVERSE_MIN_DAILY_QUOTE_KRW:
+        if volume >= min_quote_volume_krw:
             ranked.append((ticker, volume))
     ranked.sort(key=lambda item: item[1], reverse=True)
     top30 = [ticker for ticker, _ in ranked[:30]]
-    noise_filtered = _noise_ratio_filter_from_frames(frames, ts, top30, threshold=UNIVERSE_NOISE_THRESHOLD)
-    atr_filtered = _exclude_high_atr_pct_from_frames(
-        frames,
-        ts,
-        noise_filtered,
-        exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+    top_volume_ranked = ranked[:30]
+    surge_ranked = _volume_surge_from_frames(frames, ts, candidates=top30)
+    rsi_momentum_ranked = _rsi_momentum_from_frames(frames, ts, candidates=top30)
+    mixed = blend_universe_candidates(top_volume_ranked, surge_ranked, rsi_momentum_ranked, limit=30, rsi_bonus_count=5)
+    noise_filtered = mixed
+    if noise_threshold is not None:
+        noise_map = _noise_ratio_map_from_frames(frames, ts, mixed)
+        noise_filtered = filter_by_noise_threshold(mixed, noise_map, threshold=noise_threshold)
+    atr_filtered = noise_filtered
+    if atr_exclude_ratio > 0:
+        atr_filtered = exclude_high_atr_candidates(
+            noise_filtered,
+            _atr_pct_map_from_frames(frames, ts, noise_filtered),
+            exclude_ratio=atr_exclude_ratio,
+        )
+    beta_top = prioritize_by_beta(
+        atr_filtered,
+        _beta_map_from_frames(frames, ts, atr_filtered),
+        topn=beta_top_n or limit,
+        min_beta=beta_min,
     )
-    beta_top = _beta_top_from_frames(frames, ts, atr_filtered, topn=UNIVERSE_BETA_TOP_N)
     if beta_top:
         return beta_top[:limit]
     return atr_filtered[:limit]
@@ -511,6 +543,11 @@ def select_daily_universe_from_frames(
     day: pd.Timestamp,
     *,
     limit: int = UNIVERSE_TOP_N,
+    min_quote_volume_krw: float = 0.0,
+    noise_threshold: float | None = None,
+    atr_exclude_ratio: float = 0.0,
+    beta_min: float = 0.0,
+    beta_top_n: int | None = None,
 ) -> list[str]:
     """Select TOP N by previous completed day's quote volume to avoid lookahead."""
     current_day = pd.Timestamp(day).normalize()
@@ -521,18 +558,31 @@ def select_daily_universe_from_frames(
             continue
         window = df.loc[(df.index >= previous_day) & (df.index < current_day)]
         volume = quote_volume_krw(window)
-        if volume >= UNIVERSE_MIN_DAILY_QUOTE_KRW:
+        if volume >= min_quote_volume_krw:
             ranked.append((ticker, volume))
     ranked.sort(key=lambda item: item[1], reverse=True)
     top30 = [ticker for ticker, _ in ranked[:30]]
-    noise_filtered = _noise_ratio_filter_from_day(frames, current_day, top30, threshold=UNIVERSE_NOISE_THRESHOLD)
-    atr_filtered = _exclude_high_atr_pct_from_day(
-        frames,
-        current_day,
-        noise_filtered,
-        exclude_ratio=UNIVERSE_ATR_EXCLUDE_RATIO,
+    top_volume_ranked = ranked[:30]
+    surge_ranked = _volume_surge_from_day(frames, current_day, candidates=top30)
+    rsi_momentum_ranked = _rsi_momentum_from_day(frames, current_day, candidates=top30)
+    mixed = blend_universe_candidates(top_volume_ranked, surge_ranked, rsi_momentum_ranked, limit=30, rsi_bonus_count=5)
+    noise_filtered = mixed
+    if noise_threshold is not None:
+        noise_map = _noise_ratio_map_from_day(frames, current_day, mixed)
+        noise_filtered = filter_by_noise_threshold(mixed, noise_map, threshold=noise_threshold)
+    atr_filtered = noise_filtered
+    if atr_exclude_ratio > 0:
+        atr_filtered = exclude_high_atr_candidates(
+            noise_filtered,
+            _atr_pct_map_from_day(frames, current_day, noise_filtered),
+            exclude_ratio=atr_exclude_ratio,
+        )
+    beta_top = prioritize_by_beta(
+        atr_filtered,
+        _beta_map_from_day(frames, current_day, atr_filtered),
+        topn=beta_top_n or limit,
+        min_beta=beta_min,
     )
-    beta_top = _beta_top_from_day(frames, current_day, atr_filtered, topn=UNIVERSE_BETA_TOP_N)
     if beta_top:
         return beta_top[:limit]
     return atr_filtered[:limit]
@@ -611,21 +661,19 @@ def _volume_surge_from_day(
     return scored
 
 
-def _beta_top_from_frames(
+def _beta_map_from_frames(
     frames: dict[str, pd.DataFrame],
     ts: pd.Timestamp,
     candidates: list[str],
-    *,
-    topn: int = 10,
-) -> list[str]:
+) -> dict[str, float]:
     btc = frames.get("KRW-BTC")
     if btc is None:
-        return candidates[:topn]
+        return {}
     btc_window = btc.loc[btc.index <= ts].tail(25)
     if len(btc_window) < 25:
-        return candidates[:topn]
+        return {}
     btc_ret = float(btc_window["close"].iloc[-1] / btc_window["close"].iloc[0] - 1)
-    scored: list[tuple[str, float]] = []
+    beta_map: dict[str, float] = {}
     for ticker in candidates:
         df = frames.get(ticker)
         if df is None:
@@ -634,29 +682,24 @@ def _beta_top_from_frames(
         if len(window) < 25:
             continue
         ret = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1)
-        beta = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
-        scored.append((ticker, beta))
-    scored.sort(key=lambda item: item[1], reverse=True)
-    selected = [ticker for ticker, beta in scored if beta >= UNIVERSE_BETA_MIN][:topn]
-    return selected or [ticker for ticker, _ in scored[:topn]]
+        beta_map[ticker] = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
+    return beta_map
 
 
-def _beta_top_from_day(
+def _beta_map_from_day(
     frames: dict[str, pd.DataFrame],
     current_day: pd.Timestamp,
     candidates: list[str],
-    *,
-    topn: int = 10,
-) -> list[str]:
+) -> dict[str, float]:
     btc = frames.get("KRW-BTC")
     if btc is None:
-        return candidates[:topn]
+        return {}
     prev_day = current_day - pd.Timedelta(days=1)
     btc_window = btc.loc[(btc.index >= prev_day) & (btc.index < current_day)]
     if len(btc_window) < 2:
-        return candidates[:topn]
+        return {}
     btc_ret = float(btc_window["close"].iloc[-1] / btc_window["close"].iloc[0] - 1)
-    scored: list[tuple[str, float]] = []
+    beta_map: dict[str, float] = {}
     for ticker in candidates:
         df = frames.get(ticker)
         if df is None:
@@ -665,11 +708,8 @@ def _beta_top_from_day(
         if len(window) < 2:
             continue
         ret = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1)
-        beta = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
-        scored.append((ticker, beta))
-    scored.sort(key=lambda item: item[1], reverse=True)
-    selected = [ticker for ticker, beta in scored if beta >= UNIVERSE_BETA_MIN][:topn]
-    return selected or [ticker for ticker, _ in scored[:topn]]
+        beta_map[ticker] = ret / btc_ret if abs(btc_ret) > 1e-9 else 0.0
+    return beta_map
 
 
 def _rsi_momentum_from_frames(
@@ -719,15 +759,12 @@ def _rsi_momentum_from_day(
     return scored[:topn]
 
 
-def _exclude_high_atr_pct_from_frames(
+def _atr_pct_map_from_frames(
     frames: dict[str, pd.DataFrame],
     ts: pd.Timestamp,
     candidates: list[str],
-    *,
-    exclude_ratio: float = 0.10,
-) -> list[str]:
-    """B안: 후보군에서 ATR% 상위 일부(기본 10%)를 제외해 급변동 리스크를 낮춘다."""
-    scored: list[tuple[str, float]] = []
+) -> dict[str, float]:
+    atr_pct_map: dict[str, float] = {}
     for ticker in candidates:
         df = frames.get(ticker)
         if df is None:
@@ -737,24 +774,16 @@ def _exclude_high_atr_pct_from_frames(
             continue
         atr_pct = float(window["atr_pct"].mean())
         if pd.notna(atr_pct) and atr_pct > 0:
-            scored.append((ticker, atr_pct))
-    if not scored:
-        return candidates
-
-    remove_count = max(1, int(len(scored) * exclude_ratio))
-    high_atr = {ticker for ticker, _ in sorted(scored, key=lambda item: item[1], reverse=True)[:remove_count]}
-    filtered = [ticker for ticker in candidates if ticker not in high_atr]
-    return filtered or candidates
+            atr_pct_map[ticker] = atr_pct
+    return atr_pct_map
 
 
-def _exclude_high_atr_pct_from_day(
+def _atr_pct_map_from_day(
     frames: dict[str, pd.DataFrame],
     current_day: pd.Timestamp,
     candidates: list[str],
-    *,
-    exclude_ratio: float = 0.10,
-) -> list[str]:
-    scored: list[tuple[str, float]] = []
+) -> dict[str, float]:
+    atr_pct_map: dict[str, float] = {}
     prev_day = current_day - pd.Timedelta(days=1)
     for ticker in candidates:
         df = frames.get(ticker)
@@ -765,24 +794,16 @@ def _exclude_high_atr_pct_from_day(
             continue
         atr_pct = float(window["atr_pct"].mean())
         if pd.notna(atr_pct) and atr_pct > 0:
-            scored.append((ticker, atr_pct))
-    if not scored:
-        return candidates
-
-    remove_count = max(1, int(len(scored) * exclude_ratio))
-    high_atr = {ticker for ticker, _ in sorted(scored, key=lambda item: item[1], reverse=True)[:remove_count]}
-    filtered = [ticker for ticker in candidates if ticker not in high_atr]
-    return filtered or candidates
+            atr_pct_map[ticker] = atr_pct
+    return atr_pct_map
 
 
-def _noise_ratio_filter_from_frames(
+def _noise_ratio_map_from_frames(
     frames: dict[str, pd.DataFrame],
     ts: pd.Timestamp,
     candidates: list[str],
-    *,
-    threshold: float = 0.6,
-) -> list[str]:
-    kept: list[str] = []
+) -> dict[str, float]:
+    noise_map: dict[str, float] = {}
     for ticker in candidates:
         df = frames.get(ticker)
         if df is None:
@@ -790,20 +811,16 @@ def _noise_ratio_filter_from_frames(
         window = df.loc[df.index <= ts].tail(24)
         if window.empty:
             continue
-        noise = price_noise_pct(window)
-        if noise < threshold:
-            kept.append(ticker)
-    return kept or candidates
+        noise_map[ticker] = price_noise_pct(window)
+    return noise_map
 
 
-def _noise_ratio_filter_from_day(
+def _noise_ratio_map_from_day(
     frames: dict[str, pd.DataFrame],
     current_day: pd.Timestamp,
     candidates: list[str],
-    *,
-    threshold: float = 0.6,
-) -> list[str]:
-    kept: list[str] = []
+) -> dict[str, float]:
+    noise_map: dict[str, float] = {}
     prev_day = current_day - pd.Timedelta(days=1)
     for ticker in candidates:
         df = frames.get(ticker)
@@ -812,10 +829,8 @@ def _noise_ratio_filter_from_day(
         window = df.loc[(df.index >= prev_day) & (df.index < current_day)]
         if window.empty:
             continue
-        noise = price_noise_pct(window)
-        if noise < threshold:
-            kept.append(ticker)
-    return kept or candidates
+        noise_map[ticker] = price_noise_pct(window)
+    return noise_map
 
 
 def metrics(trades: list[dict], equity: pd.Series, df: pd.DataFrame | None = None) -> dict:

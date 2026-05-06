@@ -27,10 +27,10 @@ def test_backtest_selects_universe_from_recent_quote_volume():
 
     selected = backtest.select_universe_from_frames(frames, idx[-1], limit=2, lookback=3)
 
-    assert selected == ["KRW-XRP", "KRW-ETH"]
+    assert selected == ["KRW-ETH"]
 
 
-def test_backtest_excludes_low_volatility_from_top_volume_universe():
+def test_backtest_selects_from_recent_quote_volume_with_production_filters_disabled_by_default():
     idx = pd.date_range("2026-01-01", periods=3, freq="h")
     frames = {
         "KRW-BTC": pd.DataFrame({"close": [100.0] * 3, "volume": [100.0] * 3, "atr_pct": [0.001] * 3}, index=idx),
@@ -41,7 +41,7 @@ def test_backtest_excludes_low_volatility_from_top_volume_universe():
 
     selected = backtest.select_universe_from_frames(frames, idx[-1], limit=4, lookback=3)
 
-    assert selected == ["KRW-XRP", "KRW-ETH", "KRW-SOL"]
+    assert selected == ["KRW-ETH"]
 
 
 def test_backtest_selects_daily_universe_from_previous_completed_day():
@@ -61,7 +61,7 @@ def test_backtest_selects_daily_universe_from_previous_completed_day():
 
     selected = backtest.select_daily_universe_from_frames(frames, pd.Timestamp("2026-01-02"), limit=2)
 
-    assert selected == ["KRW-XRP", "KRW-ETH"]
+    assert selected == ["KRW-ETH"]
 
 
 def test_backtest_counts_daily_universe_membership():
@@ -86,4 +86,4 @@ def test_backtest_counts_daily_universe_membership():
         limit=2,
     )
 
-    assert counts == {"KRW-XRP": 1, "KRW-ETH": 1}
+    assert counts == {"KRW-ETH": 1}
